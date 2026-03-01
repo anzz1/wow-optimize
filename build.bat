@@ -1,6 +1,7 @@
 @echo off
 echo ============================================
-echo   wow_optimize.dll BY SUPREMATIST build script
+echo   wow_optimize v1.1 build script
+echo   Builds: wow_optimize.dll + version.dll
 echo   Requires: Visual Studio 2022 + CMake
 echo ============================================
 echo.
@@ -16,7 +17,7 @@ if errorlevel 1 (
 if not exist build mkdir build
 cd build
 
-echo [1/3] Configuring ^(32-bit^)...
+echo [1/3] Configuring (32-bit)...
 cmake -G "Visual Studio 17 2022" -A Win32 .. 2>&1
 if errorlevel 1 (
     echo Trying Visual Studio 2019...
@@ -42,8 +43,15 @@ if errorlevel 1 (
 echo.
 echo [3/3] Done!
 echo.
-echo Output: build\Release\wow_optimize.dll
-echo Copy it to your WoW folder and inject.
+echo Output files:
+echo   build\Release\wow_optimize.dll  - optimization DLL
+echo   build\Release\version.dll       - auto-loader proxy
+echo.
+echo OPTION A (recommended):
+echo   Copy BOTH files to your WoW folder. No injector needed.
+echo.
+echo OPTION B (manual):
+echo   Copy wow_optimize.dll + use inject.bat or any DLL injector.
 echo.
 cd ..
 pause

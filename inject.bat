@@ -13,21 +13,19 @@ if not exist Wow.exe (
 )
 
 if not exist wow_optimize.dll (
-    echo ERROR: wow_optimize.dll not found in current folder.
-    echo.
+    echo ERROR: wow_optimize.dll not found.
     pause
     exit /b 1
 )
 
 if not exist Dll_Injector.exe (
-    echo ERROR: Dll_Injector.exe not found in current folder.
-    echo.
+    echo ERROR: Dll_Injector.exe not found.
     pause
     exit /b 1
 )
 
-echo Waiting for Wow.exe to be running...
-echo Make sure WoW is launched and you see the login screen.
+echo Waiting for Wow.exe...
+echo Make sure WoW is running and you see the login screen.
 echo.
 
 :wait_loop

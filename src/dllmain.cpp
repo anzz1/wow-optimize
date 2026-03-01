@@ -1,27 +1,30 @@
 // ================================================================
-//  wow_optimize.dll BY SUPREMATIST
+//  wow_optimize.dll v1.1 BY SUPREMATIST
 //  Performance optimization DLL for World of Warcraft 3.3.5a
 //
 //  Features:
-//    - Microsoft mimalloc allocator (replaces ancient msvcr80 CRT)
-//    - Precise frame pacing (Sleep hook with QPC busy-wait)
-//    - TCP_NODELAY on all sockets (lower network latency)
-//    - High-precision GetTickCount (QPC-based)
-//    - CriticalSection spin optimization (fewer context switches)
-//    - ReadFile read-ahead cache (faster MPQ loading)
-//    - CreateFile sequential scan hints (OS prefetch for MPQ)
-//    - High timer resolution (0.5ms via NtSetTimerResolution)
-//    - Thread affinity pinning (stable L1/L2 cache)
-//    - Working set locking (prevent page-outs)
-//    - FPS cap removal (200 -> 999)
-//    - Process priority optimization
+//    1.  Microsoft mimalloc allocator (replaces ancient CRT)
+//    2.  Precise frame pacing (Sleep hook with QPC busy-wait)
+//    3.  TCP_NODELAY on all sockets (lower network latency)
+//    4.  High-precision GetTickCount (QPC-based)
+//    5.  CriticalSection spin optimization (fewer context switches)
+//    6.  ReadFile read-ahead cache (MPQ-only, faster loading)
+//    7.  CreateFile sequential scan hints (OS prefetch for MPQ)
+//    8.  CloseHandle cache invalidation (prevents stale data)
+//    9.  High timer resolution (0.5ms via NtSetTimerResolution)
+//    10. Thread affinity pinning (stable L1/L2 cache)
+//    11. Working set locking (prevent page-outs)
+//    12. FPS cap removal (200 -> 999)
+//    13. Process priority optimization
 //
 //  Must be compiled as 32-bit (x86).
 //  WoW 3.3.5a is a 32-bit application.
 //
-//  Usage: inject this DLL into Wow.exe after the login screen loads.
-//  Check wow_optimize.log for status.
+//  Usage:
+//    Option A: Drop version.dll + wow_optimize.dll in WoW folder (auto-load)
+//    Option B: Inject wow_optimize.dll manually with any DLL injector
 //
+//  Check wow_optimize.log for status.
 //  License: MIT
 // ================================================================
 
@@ -46,10 +49,6 @@
 
 // ================================================================
 // Logging
-//
-// All operations are logged to wow_optimize.log in the WoW
-// directory. This file is the primary way to verify that
-// the DLL is working correctly.
 // ================================================================
 static FILE* g_log = nullptr;
 
@@ -77,23 +76,7 @@ static void Log(const char* fmt, ...) {
 
 // ================================================================
 // 1. Memory Allocator Replacement (mimalloc)
-//
-// WoW 3.3.5a ships with Visual C++ 2005 runtime (msvcr80.dll).
-// Its memory allocator is nearly 20 years old and suffers from:
-//   - Slow allocation and deallocation
-//   - Severe memory fragmentation over long sessions
-//   - Poor multi-threaded scaling
-//
-// We hook malloc/free/realloc/calloc/_msize from the CRT DLL
-// and redirect all allocations to Microsoft's mimalloc — a modern,
-// high-performance allocator designed for concurrent workloads.
-//
-// Safety: memory allocated BEFORE hooks are installed belongs to
-// the old heap. We detect this using mi_is_in_heap_region() and
-// route old pointers to the original free(). This prevents crashes
-// during the transition period.
 // ================================================================
-
 typedef void*  (__cdecl* malloc_fn)(size_t);
 typedef void   (__cdecl* free_fn)(void*);
 typedef void*  (__cdecl* realloc_fn)(void*, size_t);
@@ -106,21 +89,18 @@ static realloc_fn orig_realloc = nullptr;
 static calloc_fn  orig_calloc  = nullptr;
 static msize_fn   orig_msize   = nullptr;
 
-// All new allocations go through mimalloc
 static void* __cdecl hooked_malloc(size_t size) {
     return mi_malloc(size);
 }
 
-// Free: check which allocator owns the pointer
 static void __cdecl hooked_free(void* ptr) {
     if (!ptr) return;
     if (mi_is_in_heap_region(ptr))
-        mi_free(ptr);          // Allocated after hooks — use mimalloc
+        mi_free(ptr);
     else
-        orig_free(ptr);        // Allocated before hooks — use original
+        orig_free(ptr);
 }
 
-// Realloc: handle cross-allocator migration
 static void* __cdecl hooked_realloc(void* ptr, size_t size) {
     if (!ptr) return mi_malloc(size);
     if (size == 0) { hooked_free(ptr); return nullptr; }
@@ -128,7 +108,6 @@ static void* __cdecl hooked_realloc(void* ptr, size_t size) {
     if (mi_is_in_heap_region(ptr))
         return mi_realloc(ptr, size);
 
-    // Old allocation: copy data to mimalloc, free with original
     if (orig_msize) {
         size_t old_size = orig_msize(ptr);
         if (old_size > 0) {
@@ -143,29 +122,21 @@ static void* __cdecl hooked_realloc(void* ptr, size_t size) {
     return orig_realloc(ptr, size);
 }
 
-// Calloc: always a new allocation
 static void* __cdecl hooked_calloc(size_t count, size_t size) {
     return mi_calloc(count, size);
 }
 
-// _msize: return usable size from the correct allocator
 static size_t __cdecl hooked_msize(void* ptr) {
     if (!ptr) return 0;
     if (mi_is_in_heap_region(ptr)) return mi_usable_size(ptr);
     return orig_msize ? orig_msize(ptr) : 0;
 }
 
-// Auto-detect and hook whichever CRT DLL WoW loaded
 static bool InstallAllocatorHooks() {
     const char* crt_names[] = {
-        "msvcr80.dll",    // VS2005 — original WoW 3.3.5a
-        "msvcr90.dll",    // VS2008
-        "msvcr100.dll",   // VS2010
-        "msvcr110.dll",   // VS2012
-        "msvcr120.dll",   // VS2013
-        "ucrtbase.dll",   // VS2015+ Universal CRT
-        "msvcrt.dll",     // System CRT
-        nullptr
+        "msvcr80.dll", "msvcr90.dll", "msvcr100.dll",
+        "msvcr110.dll", "msvcr120.dll", "ucrtbase.dll",
+        "msvcrt.dll", nullptr
     };
 
     HMODULE hCRT = nullptr;
@@ -176,10 +147,7 @@ static bool InstallAllocatorHooks() {
         if (hCRT) { found_crt = crt_names[i]; break; }
     }
 
-    if (!hCRT) {
-        Log("ERROR: No CRT DLL found in process");
-        return false;
-    }
+    if (!hCRT) { Log("ERROR: No CRT DLL found"); return false; }
     Log("Found CRT: %s at 0x%p", found_crt, hCRT);
 
     void* pm = (void*)GetProcAddress(hCRT, "malloc");
@@ -188,19 +156,16 @@ static bool InstallAllocatorHooks() {
     void* pc = (void*)GetProcAddress(hCRT, "calloc");
     void* ps = (void*)GetProcAddress(hCRT, "_msize");
 
-    if (!pm || !pf || !pr) {
-        Log("ERROR: Could not find malloc/free/realloc in %s", found_crt);
-        return false;
-    }
+    if (!pm || !pf || !pr) { Log("ERROR: malloc/free/realloc not found"); return false; }
 
     int ok = 0, total = 0;
 
     #define TRY_HOOK(target, hook, orig, name)                    \
         if (target) { total++;                                    \
             if (MH_CreateHook(target, (void*)(hook),              \
-                              (void**)&(orig)) == MH_OK) {        \
+                              (void**)&(orig)) == MH_OK) {       \
                 ok++; Log("  Hook %s: OK", name);                 \
-            } else { Log("  Hook %s: FAILED", name); }            \
+            } else { Log("  Hook %s: FAILED", name); }           \
         }
 
     TRY_HOOK(pm, hooked_malloc,  orig_malloc,  "malloc");
@@ -220,21 +185,7 @@ static bool InstallAllocatorHooks() {
 
 // ================================================================
 // 2. Sleep Hook — Precise Frame Pacing
-//
-// WoW calls Sleep(1) for frame rate limiting.
-// Problem: Windows Sleep(1) actually sleeps 1-15ms depending on
-// system timer resolution and scheduler state. This causes
-// inconsistent frame times and micro-stutter.
-//
-// Solution: for small sleeps (1-3ms), we replace Sleep() with
-// a busy-wait loop using QueryPerformanceCounter (microsecond
-// precision). For large sleeps (loading screens, etc.), we use
-// the original Sleep() to avoid wasting CPU.
-//
-// _mm_pause() tells the CPU we're in a spin loop, reducing
-// power consumption and improving hyper-threading performance.
 // ================================================================
-
 typedef void (WINAPI* Sleep_fn)(DWORD);
 static Sleep_fn orig_Sleep = nullptr;
 
@@ -252,9 +203,9 @@ static void PreciseSleep(double milliseconds) {
 }
 
 static void WINAPI hooked_Sleep(DWORD ms) {
-    if (ms == 0) { orig_Sleep(0); return; }       // Yield timeslice
-    if (ms <= 3) { PreciseSleep((double)ms); return; }  // Precise busy-wait
-    orig_Sleep(ms);                                // Large sleep — use original
+    if (ms == 0) { orig_Sleep(0); return; }
+    if (ms <= 3) { PreciseSleep((double)ms); return; }
+    orig_Sleep(ms);
 }
 
 static bool InstallSleepHook() {
@@ -268,17 +219,7 @@ static bool InstallSleepHook() {
 
 // ================================================================
 // 3. TCP_NODELAY — Disable Nagle's Algorithm
-//
-// Nagle's algorithm buffers small TCP packets and sends them
-// in batches. This saves bandwidth but adds 40-200ms latency —
-// catastrophic for real-time games.
-//
-// We hook connect() and set TCP_NODELAY on every socket WoW
-// creates, ensuring packets are sent immediately.
-//
-// Also sets a 32KB send buffer for optimal throughput.
 // ================================================================
-
 typedef int (WINAPI* connect_fn)(SOCKET, const struct sockaddr*, int);
 static connect_fn orig_connect = nullptr;
 
@@ -325,12 +266,12 @@ static bool InstallNetworkHooks() {
 }
 
 // ================================================================
-// MPQ Handle Tracking
-// We only want to cache reads from MPQ files (read-only archives).
-// SavedVariables, config files, and other writable files must
-// NEVER be cached or they will get corrupted on /reload.
+// 4. MPQ Handle Tracking
+//
+// Only MPQ files (read-only archives) should be cached.
+// SavedVariables and config files must NEVER be cached
+// or they will be corrupted on /reload.
 // ================================================================
-
 static HANDLE g_mpqHandles[256] = {};
 static int    g_mpqHandleCount = 0;
 static CRITICAL_SECTION g_mpqHandleLock;
@@ -367,22 +308,8 @@ static void UntrackMpqHandle(HANDLE h) {
 }
 
 // ================================================================
-// 4. ReadFile Cache — Read-Ahead for MPQ Files
-//
-// WoW reads data from MPQ archives using many small ReadFile()
-// calls (512B-4KB). Each call is a kernel syscall with overhead.
-//
-// We implement a simple read-ahead cache: when WoW requests a
-// small read, we actually read 64KB and serve subsequent reads
-// from the buffer. This dramatically reduces syscall count.
-//
-// On HDD: ~40% faster zone loading
-// On SSD: ~20% faster zone loading
-//
-// Only synchronous (non-overlapped) reads are cached.
-// Async I/O and large reads pass through unchanged.
+// 5. ReadFile Cache — MPQ-Only Read-Ahead
 // ================================================================
-
 typedef BOOL (WINAPI* ReadFile_fn)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 static ReadFile_fn orig_ReadFile = nullptr;
 
@@ -396,7 +323,7 @@ struct ReadCache {
 };
 
 static const int   MAX_CACHED_HANDLES = 16;
-static const DWORD READ_AHEAD_SIZE    = 64 * 1024; // 64KB
+static const DWORD READ_AHEAD_SIZE    = 64 * 1024;
 static ReadCache   g_readCache[MAX_CACHED_HANDLES] = {};
 static CRITICAL_SECTION g_cacheLock;
 static bool g_cacheInitialized = false;
@@ -420,7 +347,6 @@ static ReadCache* AllocCache(HANDLE h) {
             return &g_readCache[i];
         }
     }
-    // Evict slot 0 (simple FIFO)
     g_readCache[0].handle = h;
     g_readCache[0].validBytes = 0;
     g_readCache[0].active = true;
@@ -430,8 +356,7 @@ static ReadCache* AllocCache(HANDLE h) {
 static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
                                     DWORD nBytesToRead, LPDWORD lpBytesRead,
                                     LPOVERLAPPED lpOverlapped) {
-    // CRITICAL: Only cache reads from MPQ files!
-    // Caching SavedVariables/config files causes data corruption on /reload
+    // Only cache reads from MPQ files (read-only archives)
     if (lpOverlapped || !g_cacheInitialized || !IsMpqHandle(hFile) ||
         nBytesToRead >= READ_AHEAD_SIZE) {
         return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
@@ -448,7 +373,6 @@ static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
 
     ReadCache* cache = FindCache(hFile);
 
-    // Cache hit check
     if (cache && cache->validBytes > 0) {
         LONGLONG cStart = cache->fileOffset.QuadPart;
         LONGLONG cEnd   = cStart + cache->validBytes;
@@ -469,7 +393,6 @@ static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
         }
     }
 
-    // Cache miss — read ahead
     if (!cache) cache = AllocCache(hFile);
 
     if (cache && cache->buffer) {
@@ -514,17 +437,8 @@ static bool InstallReadFileHook() {
 }
 
 // ================================================================
-// 5. GetTickCount Hook — High-Precision Timer
-//
-// WoW calls GetTickCount() thousands of times per frame for
-// internal timers (animations, cooldowns, buff durations, etc.).
-// Default resolution is 15.625ms — coarse and imprecise.
-//
-// We replace it with a QueryPerformanceCounter-based version
-// that has microsecond resolution, making all internal timers
-// significantly more precise.
+// 6. GetTickCount Hook — High-Precision Timer
 // ================================================================
-
 typedef DWORD (WINAPI* GetTickCount_fn)(void);
 static GetTickCount_fn orig_GetTickCount = nullptr;
 
@@ -554,21 +468,8 @@ static bool InstallGetTickCountHook() {
 }
 
 // ================================================================
-// 6. CriticalSection Optimization
-//
-// WoW uses many CriticalSections for thread synchronization.
-// Default behavior: when a thread can't acquire the lock, it
-// immediately makes an expensive kernel call (context switch).
-//
-// We hook InitializeCriticalSection() to add a spin count of 4000.
-// This means the thread will spin-wait for 4000 iterations before
-// falling back to a kernel wait. Since most critical sections in
-// WoW are held for very short durations, the spinning thread
-// almost always acquires the lock without a context switch.
-//
-// Microsoft uses this exact spin count for their heap locks.
+// 7. CriticalSection Optimization
 // ================================================================
-
 typedef void (WINAPI* InitCS_fn)(LPCRITICAL_SECTION);
 static InitCS_fn orig_InitCS = nullptr;
 
@@ -588,14 +489,8 @@ static bool InstallCriticalSectionHook() {
 }
 
 // ================================================================
-// 7. CreateFile Optimization — Sequential Scan Hints
-//
-// When WoW opens MPQ data files for reading, we add the
-// FILE_FLAG_SEQUENTIAL_SCAN flag. This tells the Windows cache
-// manager to read ahead aggressively, which improves I/O
-// performance for the sequential access pattern MPQ uses.
+// 8. CreateFile Optimization — Sequential Scan + MPQ Tracking
 // ================================================================
-
 typedef HANDLE (WINAPI* CreateFileA_fn)(LPCSTR, DWORD, DWORD,
     LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 typedef HANDLE (WINAPI* CreateFileW_fn)(LPCWSTR, DWORD, DWORD,
@@ -621,7 +516,6 @@ static HANDLE WINAPI hooked_CreateFileA(
     HANDLE result = orig_CreateFileA(lpFileName, dwAccess, dwShare,
                                       lpSA, dwDisposition, dwFlags, hTemplate);
 
-    // Track MPQ handles so ReadFile cache only applies to them
     if (isMPQ && result != INVALID_HANDLE_VALUE) {
         TrackMpqHandle(result);
     }
@@ -670,31 +564,28 @@ static bool InstallFileHooks() {
         if (MH_EnableHook(pW) == MH_OK) ok++;
 
     if (ok > 0) {
-        Log("CreateFile hooks: ACTIVE (%d/2, sequential scan for MPQ files)", ok);
+        Log("CreateFile hooks: ACTIVE (%d/2, sequential scan + MPQ tracking)", ok);
         return true;
     }
     return false;
 }
 
 // ================================================================
-// CloseHandle Hook — cleanup cached and tracked handles
+// 9. CloseHandle Hook — Cache Invalidation
 // ================================================================
 typedef BOOL (WINAPI* CloseHandle_fn)(HANDLE);
 static CloseHandle_fn orig_CloseHandle = nullptr;
 
 static BOOL WINAPI hooked_CloseHandle(HANDLE hObject) {
-    // Safety: don't process NULL or pseudo-handles
     if (!hObject || hObject == INVALID_HANDLE_VALUE ||
         hObject == GetCurrentProcess() || hObject == GetCurrentThread()) {
         return orig_CloseHandle(hObject);
     }
 
-    // Remove from MPQ tracking (only if initialized)
     if (g_mpqHandleCount > 0) {
         UntrackMpqHandle(hObject);
     }
 
-    // Invalidate ReadFile cache for this handle
     if (g_cacheInitialized) {
         EnterCriticalSection(&g_cacheLock);
         for (int i = 0; i < MAX_CACHED_HANDLES; i++) {
@@ -715,21 +606,13 @@ static bool InstallCloseHandleHook() {
     if (!p) return false;
     if (MH_CreateHook(p, (void*)hooked_CloseHandle, (void**)&orig_CloseHandle) != MH_OK) return false;
     if (MH_EnableHook(p) != MH_OK) return false;
-    Log("CloseHandle hook: ACTIVE (cache invalidation)");
+    Log("CloseHandle hook: ACTIVE (cache invalidation on file close)");
     return true;
 }
 
 // ================================================================
-// 8. System Timer Resolution
-//
-// Windows default timer resolution is 15.625ms.
-// This affects Sleep() accuracy, scheduler granularity,
-// and overall system responsiveness.
-//
-// We set it to 0.5ms using the undocumented but stable
-// NtSetTimerResolution API (available since Windows 2000).
+// 10. System Timer Resolution
 // ================================================================
-
 static void SetHighTimerResolution() {
     typedef LONG (WINAPI* NtSetTimerRes_fn)(ULONG, BOOLEAN, PULONG);
 
@@ -747,16 +630,8 @@ static void SetHighTimerResolution() {
 }
 
 // ================================================================
-// 9. Large Memory Pages
-//
-// Standard memory pages are 4KB. Large pages are 2MB.
-// Using large pages reduces TLB (Translation Lookaside Buffer)
-// misses, speeding up memory access patterns.
-//
-// Requires "Lock pages in memory" privilege (usually admin).
-// Falls back silently to standard pages if unavailable.
+// 11. Large Memory Pages
 // ================================================================
-
 static void TryEnableLargePages() {
     HANDLE hToken;
     if (!OpenProcessToken(GetCurrentProcess(),
@@ -781,23 +656,13 @@ static void TryEnableLargePages() {
         return;
     }
 
-    // This option exists in all mimalloc versions
     mi_option_set(mi_option_allow_large_os_pages, 1);
     Log("Large pages: enabled for mimalloc");
 }
 
 // ================================================================
-// 10. Thread Optimization
-//
-// Pin WoW's main thread to a specific CPU core to prevent the
-// OS scheduler from bouncing it between cores. Each core switch
-// flushes L1/L2 caches, causing micro-stutter.
-//
-// We find the main thread (earliest creation time), set its
-// ideal processor to core 1 (core 0 handles OS interrupts),
-// and raise its priority to HIGHEST.
+// 12. Thread Optimization
 // ================================================================
-
 static void OptimizeThreads() {
     DWORD pid = GetCurrentProcessId();
     DWORD mainTid = 0;
@@ -843,47 +708,34 @@ static void OptimizeThreads() {
 }
 
 // ================================================================
-// 11. Process-Level Optimization
+// 13. Process-Level Optimization
 // ================================================================
-
 static void OptimizeProcess() {
-    // Above Normal priority (not High — that can starve system processes)
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
-
-    // Disable priority boost for consistent frame timing
     SetProcessPriorityBoost(GetCurrentProcess(), TRUE);
-
     Log("Process: Above Normal priority, priority boost disabled");
 }
 
 // ================================================================
-// 12. Working Set Optimization
-//
-// Tell Windows to keep at least 256MB of WoW's memory in
-// physical RAM. Prevents page-outs that cause micro-stutter
-// when switching between WoW and other applications.
+// 14. Working Set Optimization
 // ================================================================
-
 static void OptimizeWorkingSet() {
-    SIZE_T minWS = 256 * 1024 * 1024;       // 256 MB minimum
-    SIZE_T maxWS = 2048ULL * 1024 * 1024;    // 2 GB maximum
+    SIZE_T minWS = 256 * 1024 * 1024;
+    SIZE_T maxWS = 2048ULL * 1024 * 1024;
 
     if (SetProcessWorkingSetSize(GetCurrentProcess(), minWS, maxWS))
         Log("Working set: min 256 MB, max 2048 MB");
     else
-        Log("WARNING: Working set optimization failed (error %lu)", GetLastError());
+        Log("WARNING: Working set failed (error %lu)", GetLastError());
 }
 
 // ================================================================
-// 13. mimalloc Configuration
+// 15. mimalloc Configuration
 // ================================================================
-
 static void ConfigureMimalloc() {
-    // Only use options guaranteed to exist in mimalloc v3.x
     mi_option_set(mi_option_allow_large_os_pages, 1);
     mi_option_set(mi_option_purge_delay, 0);
 
-    // Pre-allocate and touch 64MB to warm up the allocator
     void* warmup = mi_malloc(64 * 1024 * 1024);
     if (warmup) {
         memset(warmup, 0, 64 * 1024 * 1024);
@@ -894,16 +746,8 @@ static void ConfigureMimalloc() {
 }
 
 // ================================================================
-// 14. FPS Cap Removal
-//
-// WoW 3.3.5a has a hardcoded 200 FPS cap.
-// We find the comparison instruction (cmp eax, 0xC8)
-// via signature scanning and change 200 to 999.
-//
-// Only matters if you have a 240Hz+ monitor or want
-// lower input latency through higher frame rates.
+// 16. FPS Cap Removal
 // ================================================================
-
 static uintptr_t FindPattern(uintptr_t base, size_t size,
                               const uint8_t* pat, const char* mask) {
     for (size_t i = 0; i < size; i++) {
@@ -926,7 +770,6 @@ static void TryRemoveFPSCap() {
     if (!GetModuleInformation(GetCurrentProcess(), hWow, &modInfo, sizeof(modInfo)))
         return;
 
-    // cmp eax, 200 (0xC8) — FPS cap check
     const uint8_t pat[] = { 0x3D, 0xC8, 0x00, 0x00, 0x00 };
     uintptr_t addr = FindPattern((uintptr_t)hWow, modInfo.SizeOfImage, pat, "xxxxx");
 
@@ -944,18 +787,13 @@ static void TryRemoveFPSCap() {
 
 // ================================================================
 // Main initialization thread
-//
-// Runs in a separate thread to avoid blocking WoW's startup.
-// Waits 5 seconds for all WoW subsystems to initialize before
-// installing any hooks.
 // ================================================================
-
 static DWORD WINAPI MainThread(LPVOID param) {
     Sleep(5000);
 
     LogOpen();
     Log("========================================");
-    Log("  wow_optimize.dll BY SUPREMATIST");
+    Log("  wow_optimize.dll v1.1 BY SUPREMATIST");
     Log("  PID: %lu", GetCurrentProcessId());
     Log("========================================");
 
@@ -992,7 +830,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("--- File I/O ---");
     bool fileOk = InstallFileHooks();
     bool readOk = InstallReadFileHook();
-    bool closeOk = InstallCloseHandleHook(); 
+    bool closeOk = InstallCloseHandleHook();
 
     Log("--- System Timer ---");
     SetHighTimerResolution();
@@ -1012,14 +850,14 @@ static DWORD WINAPI MainThread(LPVOID param) {
     Log("  Initialization complete");
     Log("========================================");
     Log("");
-    Log("  [%s] mimalloc allocator",          allocOk ? " OK " : "FAIL");
-    Log("  [%s] Sleep hook (frame pacing)",   sleepOk ? " OK " : "FAIL");
-    Log("  [%s] GetTickCount (precision)",    tickOk  ? " OK " : "FAIL");
-    Log("  [%s] CriticalSection (spin lock)", csOk    ? " OK " : "FAIL");
-    Log("  [%s] TCP_NODELAY (network)",       netOk   ? " OK " : "FAIL");
-    Log("  [%s] CreateFile (sequential I/O)", fileOk  ? " OK " : "FAIL");
-    Log("  [%s] ReadFile (read-ahead cache)", readOk  ? " OK " : "FAIL");
-    Log("  [%s] CloseHandle (cache cleanup)",  closeOk ? " OK " : "FAIL");
+    Log("  [%s] mimalloc allocator",            allocOk ? " OK " : "FAIL");
+    Log("  [%s] Sleep hook (frame pacing)",     sleepOk ? " OK " : "FAIL");
+    Log("  [%s] GetTickCount (precision)",      tickOk  ? " OK " : "FAIL");
+    Log("  [%s] CriticalSection (spin lock)",   csOk    ? " OK " : "FAIL");
+    Log("  [%s] TCP_NODELAY (network)",         netOk   ? " OK " : "FAIL");
+    Log("  [%s] CreateFile (sequential I/O)",   fileOk  ? " OK " : "FAIL");
+    Log("  [%s] ReadFile (MPQ read-ahead)",     readOk  ? " OK " : "FAIL");
+    Log("  [%s] CloseHandle (cache cleanup)",   closeOk ? " OK " : "FAIL");
     Log("  [ OK ] Timer resolution (0.5ms)");
     Log("  [ OK ] Thread affinity + priority");
     Log("  [ OK ] Working set (256MB-2GB)");
@@ -1032,7 +870,6 @@ static DWORD WINAPI MainThread(LPVOID param) {
 // ================================================================
 // DLL entry point
 // ================================================================
-
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     switch (reason) {
         case DLL_PROCESS_ATTACH:
@@ -1052,7 +889,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             }
             if (g_cacheInitialized) {
                 DeleteCriticalSection(&g_cacheLock);
-                DeleteCriticalSection(&g_mpqHandleLock); 
+                DeleteCriticalSection(&g_mpqHandleLock);
             }
 
             Log("wow_optimize.dll unloaded");

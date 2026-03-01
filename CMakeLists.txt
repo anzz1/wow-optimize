@@ -22,7 +22,7 @@ set(MI_BUILD_TESTS  OFF CACHE BOOL "" FORCE)
 set(MI_OVERRIDE     OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(mimalloc)
 
-# Build our DLL
+# === Main optimization DLL ===
 add_library(wow_optimize SHARED src/dllmain.cpp)
 
 target_link_libraries(wow_optimize PRIVATE
@@ -37,7 +37,6 @@ target_include_directories(wow_optimize PRIVATE
     ${mimalloc_SOURCE_DIR}/include
 )
 
-# Static CRT linkage — no external runtime DLL dependencies
 set_target_properties(wow_optimize PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
 )
@@ -46,4 +45,20 @@ target_compile_definitions(wow_optimize PRIVATE
     WIN32_LEAN_AND_MEAN
     _CRT_SECURE_NO_WARNINGS
     _WINSOCK_DEPRECATED_NO_WARNINGS
+)
+
+# === Proxy DLL (version.dll) — auto-loader ===
+add_library(version SHARED
+    src/version_proxy.cpp
+    src/version_exports.def
+)
+
+set_target_properties(version PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    OUTPUT_NAME "version"
+)
+
+target_compile_definitions(version PRIVATE
+    WIN32_LEAN_AND_MEAN
+    _CRT_SECURE_NO_WARNINGS
 )
