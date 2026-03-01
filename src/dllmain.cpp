@@ -285,7 +285,13 @@ static connect_fn orig_connect = nullptr;
 static int WINAPI hooked_connect(SOCKET s, const struct sockaddr* name, int namelen) {
     int result = orig_connect(s, name, namelen);
 
-    if (result == 0 || WSAGetLastError() == WSAEWOULDBLOCK) {
+    // CRITICAL: save the last error BEFORE calling anything else
+    // WoW checks WSAGetLastError() after connect() returns
+    // If we call setsockopt() it resets the error code and WoW
+    // thinks the connection failed instead of "in progress"
+    int savedError = WSAGetLastError();
+
+    if (result == 0 || savedError == WSAEWOULDBLOCK) {
         BOOL nodelay = TRUE;
         setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
                    (const char*)&nodelay, sizeof(nodelay));
@@ -296,6 +302,10 @@ static int WINAPI hooked_connect(SOCKET s, const struct sockaddr* name, int name
 
         Log("TCP_NODELAY set on socket %d", (int)s);
     }
+
+    // CRITICAL: restore the original error code
+    // so WoW sees WSAEWOULDBLOCK as expected
+    WSASetLastError(savedError);
 
     return result;
 }
