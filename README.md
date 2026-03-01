@@ -1,4 +1,4 @@
-# 🚀 wow_optimize
+# 🚀 wow_optimize v1.1 BY SUPREMATIST
 
 **Performance optimization DLL for World of Warcraft 3.3.5a (WotLK)**
 
@@ -126,22 +126,22 @@ Press any key to close...
 
 ## 🎮 Usage
 
-### Option A — One-Click (recommended)
+### OPTION A — Auto-Load (recommended):
+  1. Copy version.dll and wow_optimize.dll to your WoW folder
+  2. Launch WoW normally
+  3. Done — automatic every time
 
-1. Download the [latest release](../../releases/latest) and extract to your WoW folder
-2. Launch `Wow.exe` → wait for login screen
-3. Double-click `inject.bat`
-4. Check `wow_optimize.log` to verify
+### OPTION B — Manual Injection:
+  1. Copy wow_optimize.dll, Dll_Injector.exe, inject.bat to WoW folder
+  2. Launch WoW, wait for login screen
+  3. Double-click inject.bat
 
-### Option B — Manual Injection
+### VERIFY:
+  Check wow_optimize.log after launching
+  All lines should show [ OK ]
 
-If you prefer to use your own injector:
-
-1. Copy `wow_optimize.dll` to your WoW folder
-2. Launch `Wow.exe` → wait for login screen
-3. Inject using any DLL injector:
-
-### Step 4 — Verify
+### UNINSTALL:
+  Delete version.dll (and wow_optimize.dll) from WoW folder
 
 Open `wow_optimize.log` in your WoW folder. You should see:
 
