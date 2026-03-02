@@ -297,7 +297,7 @@ What this DLL **does**:
 
 > Windows fullscreen optimizations can interfere with how the application loads DLLs from its working directory. Disabling this feature forces Windows to use the classic DLL search order, allowing the proxy `version.dll` to be loaded correctly.
 
-![Disable fullscreen optimizations](screenshots/wow.exe%20properties.png)
+![Disable fullscreen optimizations](screenshots/wow.exe%20properties.jpg)
 
 ---
 
