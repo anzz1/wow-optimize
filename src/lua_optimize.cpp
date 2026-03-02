@@ -2,7 +2,8 @@
 //  Lua VM Optimizer — Implementation
 //  WoW 3.3.5a build 12340 (Warmane)
 //
-//  Thanks for addresses to some ppl(my friend Choko especially) and also IDA Pro.
+//  4-tier GC stepping: loading → combat → idle → normal
+//  Reads addon state from Lua globals, adjusts step size per-frame.
 //
 //  IMPORTANT: WoW validates C function pointers passed via
 //  lua_pushcclosure(). If the pointer is outside Wow.exe's
@@ -109,17 +110,28 @@ static struct {
 } Api;
 
 // ================================================================
-//  Configuration
+//  Configuration — 4-tier GC stepping
+//
+//  Priority order (highest first):
+//    loading  → loadingStepKB  (most aggressive, screen is frozen)
+//    combat   → combatStepKB   (minimal, protect frametime)
+//    idle     → idleStepKB     (aggressive, player is AFK)
+//    normal   → normalStepKB   (balanced)
 // ================================================================
 
 static struct {
-    int  gcPause       = 110;
-    int  gcStepMul     = 300;
-    int  normalStepKB  = 64;
-    int  combatStepKB  = 16;
-    int  idleStepKB    = 128;
-    bool manualGCMode  = true;
-    bool inCombat      = false;
+    int  gcPause        = 110;
+    int  gcStepMul      = 300;
+    int  normalStepKB   = 64;
+    int  combatStepKB   = 16;
+    int  idleStepKB     = 128;
+    int  loadingStepKB  = 256;
+    bool manualGCMode   = true;
+
+    // State read from addon globals every frame
+    bool inCombat       = false;
+    bool isIdle         = false;
+    bool isLoading      = false;
 } Config;
 
 // ================================================================
@@ -140,8 +152,10 @@ static struct {
     int    gcStepsTotal    = 0;
     int    fullCollects    = 0;
 
-    // Stats update throttle
     int    statsUpdateCounter = 0;
+
+    // Track mode changes for logging
+    const char* lastModeName = "unknown";
 } State;
 
 // ================================================================
@@ -203,7 +217,6 @@ static bool ResolveAddresses() {
 
     #undef RESOLVE
 
-    // lua_State pointer
     if (IsReadableMemory(Addr::lua_State_ptr)) {
         Log("[LuaOpt]   %-22s 0x%08X  OK (data)", "lua_State* ptr", (unsigned)Addr::lua_State_ptr);
         found++;
@@ -250,7 +263,6 @@ static bool OptimizeGC(lua_State* L) {
     if (!Api.lua_gc) return false;
 
     __try {
-        // Verify with a safe read-only call
         int testMem = Api.lua_gc(L, LUA_GCCOUNT, 0);
         if (testMem < 0 || testMem > 4 * 1024 * 1024) {
             Log("[LuaOpt] lua_gc returned implausible value %d — aborting", testMem);
@@ -258,7 +270,6 @@ static bool OptimizeGC(lua_State* L) {
         }
         Log("[LuaOpt] lua_gc verified OK: Lua memory = %d KB", testMem);
 
-        // Save originals
         State.origGCPause   = Api.lua_gc(L, LUA_GCSETPAUSE,   Config.gcPause);
         State.origGCStepMul = Api.lua_gc(L, LUA_GCSETSTEPMUL, Config.gcStepMul);
 
@@ -302,17 +313,39 @@ static void RestoreGC(lua_State* L) {
     State.gcOptimized = false;
 }
 
-// Per-frame GC step
+// ================================================================
+//  4-tier GC Step Size Selection
+//
+//  Priority: loading > combat > idle > normal
+//
+//  Why loading is highest priority:
+//    During loading screens WoW is not rendering frames,
+//    so we can do aggressive GC without affecting frametime.
+//    This cleans up garbage BEFORE the player sees the world.
+//
+//  Why combat is above idle:
+//    If somehow both flags are set, combat wins (protect fps).
+// ================================================================
+
+static const char* GetGCModeName() {
+    if (Config.isLoading) return "loading";
+    if (Config.inCombat)  return "combat";
+    if (Config.isIdle)    return "idle";
+    return "normal";
+}
+
+static int GetCurrentStepKB() {
+    if (Config.isLoading) return Config.loadingStepKB;
+    if (Config.inCombat)  return Config.combatStepKB;
+    if (Config.isIdle)    return Config.idleStepKB;
+    return Config.normalStepKB;
+}
+
+// Per-frame GC step — called from Sleep hook on main thread
 static void StepGC(lua_State* L) {
     if (!State.gcOptimized || !Api.lua_gc) return;
 
-    int stepKB = Config.inCombat ? Config.combatStepKB : Config.idleStepKB;
-
-    // Use normalStepKB when not in combat but also not "idle"
-    // (The addon handles idle detection, DLL just knows combat/not)
-    if (!Config.inCombat) {
-        stepKB = Config.normalStepKB;
-    }
+    int stepKB = GetCurrentStepKB();
 
     __try {
         int done = Api.lua_gc(L, LUA_GCSTEP, stepKB);
@@ -322,7 +355,7 @@ static void StepGC(lua_State* L) {
             State.fullCollects++;
         }
 
-        // Update memory stats every ~64 frames (~1 second)
+        // Update memory stats every ~64 frames
         State.statsUpdateCounter++;
         if ((State.statsUpdateCounter & 63) == 0) {
             int kb = Api.lua_gc(L, LUA_GCCOUNT, 0);
@@ -337,22 +370,7 @@ static void StepGC(lua_State* L) {
 }
 
 // ================================================================
-//  Write Stats to Lua Globals
-//
-//  Instead of registering callable C functions (which WoW blocks),
-//  we write our stats directly into Lua global variables.
-//  The addon reads these variables to display DLL status.
-//
-//  Globals set:
-//    LUABOOST_DLL_LOADED    = true
-//    LUABOOST_DLL_VERSION   = "1.2.0"
-//    LUABOOST_DLL_GC_ACTIVE = true/false
-//    LUABOOST_DLL_MEM_KB    = number
-//    LUABOOST_DLL_GC_STEPS  = number
-//    LUABOOST_DLL_GC_FULLS  = number
-//    LUABOOST_DLL_GC_PAUSE  = number
-//    LUABOOST_DLL_GC_STEPMUL = number
-//    LUABOOST_DLL_COMBAT    = true/false
+//  Lua Global Helpers
 // ================================================================
 
 static void WriteLuaGlobal_Bool(lua_State* L, const char* name, bool value) {
@@ -373,69 +391,100 @@ static void WriteLuaGlobal_String(lua_State* L, const char* name, const char* va
     Api.lua_setfield(L, LUA_GLOBALSINDEX, name);
 }
 
-// Write all stats to Lua globals (called periodically)
+// Read a boolean global from Lua (returns 0 or 1)
+static int ReadLuaGlobal_Bool(lua_State* L, const char* name) {
+    if (!Api.lua_getfield || !Api.lua_toboolean || !Api.lua_settop) return 0;
+    Api.lua_getfield(L, LUA_GLOBALSINDEX, name);
+    int val = Api.lua_toboolean(L, -1);
+    Api.lua_settop(L, -2);  // pop
+    return val;
+}
+
+// ================================================================
+//  Read Addon State from Lua Globals
+//
+//  The addon (LuaBoost) writes these every time state changes:
+//    LUABOOST_ADDON_COMBAT  = true/false
+//    LUABOOST_ADDON_IDLE    = true/false
+//    LUABOOST_ADDON_LOADING = true/false
+//
+//  We read all three every frame from the Sleep hook.
+// ================================================================
+
+static void ReadAddonStateFromLua(lua_State* L) {
+    if (!Api.lua_getfield || !Api.lua_toboolean || !Api.lua_settop) return;
+
+    __try {
+        bool prevCombat  = Config.inCombat;
+        bool prevIdle    = Config.isIdle;
+        bool prevLoading = Config.isLoading;
+
+        Config.inCombat  = (ReadLuaGlobal_Bool(L, "LUABOOST_ADDON_COMBAT")  != 0);
+        Config.isIdle    = (ReadLuaGlobal_Bool(L, "LUABOOST_ADDON_IDLE")    != 0);
+        Config.isLoading = (ReadLuaGlobal_Bool(L, "LUABOOST_ADDON_LOADING") != 0);
+
+        // Log mode transitions (throttled, only when mode actually changes)
+        const char* currentMode = GetGCModeName();
+        if (currentMode != State.lastModeName) {
+            Log("[LuaOpt] GC mode: %s -> %s (step: %d KB/frame)",
+                State.lastModeName, currentMode, GetCurrentStepKB());
+            State.lastModeName = currentMode;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Non-critical — keep previous state
+    }
+}
+
+// ================================================================
+//  Write DLL Stats to Lua Globals (addon reads these)
+// ================================================================
+
 static void UpdateLuaStats(lua_State* L) {
     if (!Api.lua_pushnumber || !Api.lua_setfield) return;
 
     __try {
-        WriteLuaGlobal_Number(L, "LUABOOST_DLL_MEM_KB",     State.luaMemoryKB);
-        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_STEPS",   (double)State.gcStepsTotal);
-        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_FULLS",   (double)State.fullCollects);
-        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_PAUSE",   (double)Config.gcPause);
-        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_STEPMUL", (double)Config.gcStepMul);
-        WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_COMBAT",     Config.inCombat);
-        WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_GC_ACTIVE",  State.gcOptimized);
+        WriteLuaGlobal_Number(L, "LUABOOST_DLL_MEM_KB",      State.luaMemoryKB);
+        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_STEPS",    (double)State.gcStepsTotal);
+        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_FULLS",    (double)State.fullCollects);
+        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_PAUSE",    (double)Config.gcPause);
+        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_STEPMUL",  (double)Config.gcStepMul);
+        WriteLuaGlobal_Number(L, "LUABOOST_DLL_GC_STEP_KB",  (double)GetCurrentStepKB());
+        WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_COMBAT",      Config.inCombat);
+        WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_IDLE",        Config.isIdle);
+        WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_LOADING",     Config.isLoading);
+        WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_GC_ACTIVE",   State.gcOptimized);
+        WriteLuaGlobal_String(L, "LUABOOST_DLL_GC_MODE",     GetGCModeName());
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Non-critical, just skip
-    }
-}
-
-// Read combat state FROM Lua global (addon writes it)
-static void ReadCombatFromLua(lua_State* L) {
-    if (!Api.lua_getfield || !Api.lua_toboolean || !Api.lua_settop) return;
-
-    __try {
-        Api.lua_getfield(L, LUA_GLOBALSINDEX, "LUABOOST_ADDON_COMBAT");
-        int combat = Api.lua_toboolean(L, -1);
-        Api.lua_settop(L, -2);  // pop the value
-
-        Config.inCombat = (combat != 0);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Non-critical
-    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 // ================================================================
 //  Initial Setup via FrameScript_Execute
-//
-//  We execute Lua code to set up communication globals
-//  and register a simple Lua-side API that reads our globals.
 // ================================================================
 
 static void SetupLuaInterface(lua_State* L) {
     if (!Api.FrameScript_Execute) {
-        // Fallback: just set globals directly
         if (Api.lua_pushboolean && Api.lua_setfield) {
             WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_LOADED",    true);
-            WriteLuaGlobal_String(L, "LUABOOST_DLL_VERSION",   "1.2.0");
+            WriteLuaGlobal_String(L, "LUABOOST_DLL_VERSION",   "1.2.1");
             WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_GC_ACTIVE", State.gcOptimized);
-            Log("[LuaOpt] Set DLL globals via Lua API");
+            Log("[LuaOpt] Set DLL globals via Lua API (no FrameScript)");
         }
         return;
     }
 
-    // Use FrameScript_Execute to create Lua-side helper functions
-    // These are pure Lua functions (not C callbacks), so WoW won't block them
     __try {
         Api.FrameScript_Execute(
-            // Set the DLL loaded flag
             "LUABOOST_DLL_LOADED = true "
-            "LUABOOST_DLL_VERSION = '1.2.0' "
+            "LUABOOST_DLL_VERSION = '1.2.1' "
 
-            // Create helper functions that read DLL globals
-            // The addon can call these instead of C functions
+            // Initialize addon state globals if addon hasn't loaded yet
+            "if LUABOOST_ADDON_COMBAT  == nil then LUABOOST_ADDON_COMBAT  = false end "
+            "if LUABOOST_ADDON_IDLE    == nil then LUABOOST_ADDON_IDLE    = false end "
+            "if LUABOOST_ADDON_LOADING == nil then LUABOOST_ADDON_LOADING = false end "
+
+            // Pure Lua helper functions (safe — no C callbacks)
             "function LuaBoostC_IsLoaded() return true end "
 
             "function LuaBoostC_GetStats() "
@@ -445,19 +494,20 @@ static void SetupLuaInterface(lua_State* L) {
             "    LUABOOST_DLL_GC_FULLS or 0, "
             "    LUABOOST_DLL_GC_PAUSE or 0, "
             "    LUABOOST_DLL_GC_STEPMUL or 0, "
-            "    LUABOOST_DLL_COMBAT or false "
+            "    LUABOOST_DLL_COMBAT or false, "
+            "    LUABOOST_DLL_GC_MODE or 'unknown', "
+            "    LUABOOST_DLL_IDLE or false, "
+            "    LUABOOST_DLL_LOADING or false "
             "end "
 
             "function LuaBoostC_GCMemory() "
             "  return LUABOOST_DLL_MEM_KB or 0 "
             "end "
 
-            // SetCombat: addon writes to a global, DLL reads it
             "function LuaBoostC_SetCombat(v) "
             "  LUABOOST_ADDON_COMBAT = v and true or false "
             "end "
 
-            // GCStep/GCCollect: addon writes request, DLL reads it
             "LUABOOST_DLL_GC_REQUEST = nil "
             "function LuaBoostC_GCStep(kb) "
             "  LUABOOST_DLL_GC_REQUEST = kb or 100 "
@@ -471,20 +521,22 @@ static void SetupLuaInterface(lua_State* L) {
 
         Log("[LuaOpt] Lua interface created via FrameScript");
         Log("[LuaOpt]   LuaBoostC_IsLoaded()  — returns true");
-        Log("[LuaOpt]   LuaBoostC_GetStats()  — reads DLL globals");
+        Log("[LuaOpt]   LuaBoostC_GetStats()  — reads DLL globals (9 values)");
         Log("[LuaOpt]   LuaBoostC_SetCombat() — writes LUABOOST_ADDON_COMBAT");
         Log("[LuaOpt]   LuaBoostC_GCStep()    — writes LUABOOST_DLL_GC_REQUEST");
         Log("[LuaOpt]   LuaBoostC_GCCollect() — writes LUABOOST_DLL_GC_REQUEST = -1");
-
+        Log("[LuaOpt]   Reads: LUABOOST_ADDON_COMBAT, _IDLE, _LOADING");
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         Log("[LuaOpt] EXCEPTION in FrameScript_Execute");
-        // Fallback to direct globals
         WriteLuaGlobal_Bool(L, "LUABOOST_DLL_LOADED", true);
     }
 }
 
-// Process GC requests from addon (via global variable)
+// ================================================================
+//  Process GC Requests from Addon
+// ================================================================
+
 static void ProcessGCRequests(lua_State* L) {
     if (!Api.lua_getfield || !Api.lua_type || !Api.lua_tonumber ||
         !Api.lua_pushnil || !Api.lua_setfield || !Api.lua_settop || !Api.lua_gc) {
@@ -494,32 +546,28 @@ static void ProcessGCRequests(lua_State* L) {
     __try {
         Api.lua_getfield(L, LUA_GLOBALSINDEX, "LUABOOST_DLL_GC_REQUEST");
 
-        // lua_type: 0=nil, 3=number
         int t = Api.lua_type(L, -1);
         if (t == 3) {  // LUA_TNUMBER
             double val = Api.lua_tonumber(L, -1);
-            Api.lua_settop(L, -2);  // pop
+            Api.lua_settop(L, -2);
 
             // Clear the request
             Api.lua_pushnil(L);
             Api.lua_setfield(L, LUA_GLOBALSINDEX, "LUABOOST_DLL_GC_REQUEST");
 
             if (val < 0) {
-                // Full collect
                 Api.lua_gc(L, LUA_GCCOLLECT, 0);
                 State.fullCollects++;
-                Log("[LuaOpt] Addon requested full GC");
+                Log("[LuaOpt] Addon requested full GC collect");
             } else if (val > 0) {
-                // Step
                 Api.lua_gc(L, LUA_GCSTEP, (int)val);
+                State.gcStepsTotal++;
             }
         } else {
-            Api.lua_settop(L, -2);  // pop nil
+            Api.lua_settop(L, -2);
         }
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        // Non-critical
-    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 // ================================================================
@@ -536,8 +584,6 @@ static void DoMainThreadInit() {
     if (!Api.L) {
         Log("[LuaOpt] lua_State* is NULL — Lua VM not ready");
         Log("[LuaOpt] Will retry on next frame");
-
-        // Reset state so we retry
         InterlockedExchange(&g_luaInitState, 1);
         State.initialized = false;
         return;
@@ -545,25 +591,26 @@ static void DoMainThreadInit() {
 
     Log("[LuaOpt] lua_State* = 0x%08X", (unsigned)(uintptr_t)Api.L);
 
-    // Step 1: GC optimization
     bool gcOk = OptimizeGC(Api.L);
 
-    // Step 2: Setup Lua interface (globals + helper functions)
     SetupLuaInterface(Api.L);
 
-    // Step 3: Write initial stats
     if (Api.lua_pushnumber && Api.lua_setfield) {
         UpdateLuaStats(Api.L);
     }
 
     State.initialized = true;
+    State.lastModeName = GetGCModeName();
 
     Log("[LuaOpt] ====================================");
     Log("[LuaOpt]  Init Complete");
     Log("[LuaOpt]    GC optimized:     %s", gcOk ? "YES" : "NO");
     Log("[LuaOpt]    Lua interface:    via FrameScript (safe)");
-    Log("[LuaOpt]    GC step:          %d KB/frame (combat: %d)",
-        Config.normalStepKB, Config.combatStepKB);
+    Log("[LuaOpt]    GC tiers (KB/f):");
+    Log("[LuaOpt]      normal  = %d", Config.normalStepKB);
+    Log("[LuaOpt]      combat  = %d", Config.combatStepKB);
+    Log("[LuaOpt]      idle    = %d", Config.idleStepKB);
+    Log("[LuaOpt]      loading = %d", Config.loadingStepKB);
     Log("[LuaOpt] ====================================");
 }
 
@@ -584,7 +631,6 @@ bool PrepareFromWorkerThread() {
         return false;
     }
 
-    // Verify base address
     HMODULE hWow = GetModuleHandleA(nullptr);
     uintptr_t wowBase = (uintptr_t)hWow;
     Log("[LuaOpt] Wow.exe base: 0x%08X", (unsigned)wowBase);
@@ -593,7 +639,6 @@ bool PrepareFromWorkerThread() {
         Log("[LuaOpt] WARNING: Unexpected base! Addresses may be wrong.");
     }
 
-    // Pre-read test
     lua_State* testL = ReadLuaState();
     if (testL) {
         Log("[LuaOpt] lua_State* pre-read: 0x%08X", (unsigned)(uintptr_t)testL);
@@ -614,48 +659,44 @@ void OnMainThreadSleep(DWORD mainThreadId) {
     LONG state = g_luaInitState;
 
     if (state == 1) {
-        // Try init (CAS: 1→2)
         if (InterlockedCompareExchange(&g_luaInitState, 2, 1) == 1) {
             DoMainThreadInit();
-
-            // If init failed (L was NULL), it reset state back to 1
-            // We'll retry next frame
         }
         return;
     }
 
     if (state != 2 || !State.initialized || !State.gcOptimized || !Api.L) return;
 
-    // ---- Per-frame work (state == 2, initialized) ----
+    // ---- Per-frame work (main thread, between frames) ----
 
-    // Check if lua_State is still valid (handles /reload)
     lua_State* currentL = ReadLuaState();
-    if (!currentL) return;  // VM not available this frame
+    if (!currentL) return;
 
+    // Detect UI reload (lua_State pointer changed)
     if (currentL != Api.L) {
-        // UI reload detected — reinitialize
         Log("[LuaOpt] lua_State changed (UI reload) — reinitializing");
         Api.L = currentL;
         State.gcOptimized = false;
         State.gcStepsTotal = 0;
         State.fullCollects = 0;
         State.statsUpdateCounter = 0;
+        State.lastModeName = "unknown";
 
         OptimizeGC(Api.L);
         SetupLuaInterface(Api.L);
         return;
     }
 
-    // Read combat state from addon
-    ReadCombatFromLua(Api.L);
+    // Read all addon state globals (combat + idle + loading)
+    ReadAddonStateFromLua(Api.L);
 
-    // Process any GC requests from addon
+    // Process any explicit GC requests from addon
     ProcessGCRequests(Api.L);
 
-    // Incremental GC step
+    // Incremental GC step (4-tier: loading > combat > idle > normal)
     StepGC(Api.L);
 
-    // Update Lua globals with stats (every ~64 frames)
+    // Update DLL stats in Lua globals (~every 64 frames, ~1 second)
     if ((State.statsUpdateCounter & 63) == 0) {
         UpdateLuaStats(Api.L);
     }
@@ -668,7 +709,6 @@ void Shutdown() {
     if (L) {
         RestoreGC(L);
 
-        // Clear DLL loaded flag
         if (Api.lua_pushboolean && Api.lua_setfield) {
             __try {
                 WriteLuaGlobal_Bool(L, "LUABOOST_DLL_LOADED", false);
@@ -693,8 +733,8 @@ Stats GetStats() {
     Stats s = {};
     s.initialized        = State.initialized;
     s.gcOptimized        = State.gcOptimized;
-    s.allocatorReplaced  = false;  // Handled by CRT hooks
-    s.functionsRegistered = true;  // Via FrameScript (Lua functions)
+    s.allocatorReplaced  = false;
+    s.functionsRegistered = true;
     s.luaMemoryKB        = State.luaMemoryKB;
     s.gcStepsTotal       = State.gcStepsTotal;
     s.gcPause            = Config.gcPause;
