@@ -23,7 +23,11 @@ set(MI_OVERRIDE     OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(mimalloc)
 
 # === Main optimization DLL ===
-add_library(wow_optimize SHARED src/dllmain.cpp)
+add_library(wow_optimize SHARED
+    src/dllmain.cpp
+    src/lua_optimize.cpp      
+    src/lua_optimize.h        
+)
 
 target_link_libraries(wow_optimize PRIVATE
     minhook
@@ -35,6 +39,7 @@ target_link_libraries(wow_optimize PRIVATE
 target_include_directories(wow_optimize PRIVATE
     ${minhook_SOURCE_DIR}/include
     ${mimalloc_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/src   
 )
 
 set_target_properties(wow_optimize PROPERTIES

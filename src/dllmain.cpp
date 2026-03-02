@@ -1,5 +1,5 @@
 // ================================================================
-//  wow_optimize.dll v1.1 BY SUPREMATIST
+//  wow_optimize.dll v1.2 BY SUPREMATIST
 //  Performance optimization DLL for World of Warcraft 3.3.5a
 //
 //  Features:
@@ -16,6 +16,7 @@
 //    11. Working set locking (prevent page-outs)
 //    12. FPS cap removal (200 -> 999)
 //    13. Process priority optimization
+//    14. Lua VM GC optimizer (per-frame stepping, allocator) 
 //
 //  Must be compiled as 32-bit (x86).
 //  WoW 3.3.5a is a 32-bit application.
@@ -26,7 +27,6 @@
 //
 //  Check wow_optimize.log for status.
 //  License: MIT
-// ================================================================
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -43,6 +43,7 @@
 
 #include "MinHook.h"
 #include <mimalloc.h>
+#include "lua_optimize.h"
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -60,7 +61,7 @@ static void LogClose() {
     if (g_log) { fclose(g_log); g_log = nullptr; }
 }
 
-static void Log(const char* fmt, ...) {
+extern "C" void Log(const char* fmt, ...) {
     if (!g_log) return;
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -104,10 +105,8 @@ static void __cdecl hooked_free(void* ptr) {
 static void* __cdecl hooked_realloc(void* ptr, size_t size) {
     if (!ptr) return mi_malloc(size);
     if (size == 0) { hooked_free(ptr); return nullptr; }
-
     if (mi_is_in_heap_region(ptr))
         return mi_realloc(ptr, size);
-
     if (orig_msize) {
         size_t old_size = orig_msize(ptr);
         if (old_size > 0) {
@@ -141,12 +140,10 @@ static bool InstallAllocatorHooks() {
 
     HMODULE hCRT = nullptr;
     const char* found_crt = nullptr;
-
     for (int i = 0; crt_names[i]; i++) {
         hCRT = GetModuleHandleA(crt_names[i]);
         if (hCRT) { found_crt = crt_names[i]; break; }
     }
-
     if (!hCRT) { Log("ERROR: No CRT DLL found"); return false; }
     Log("Found CRT: %s at 0x%p", found_crt, hCRT);
 
@@ -155,37 +152,33 @@ static bool InstallAllocatorHooks() {
     void* pr = (void*)GetProcAddress(hCRT, "realloc");
     void* pc = (void*)GetProcAddress(hCRT, "calloc");
     void* ps = (void*)GetProcAddress(hCRT, "_msize");
-
     if (!pm || !pf || !pr) { Log("ERROR: malloc/free/realloc not found"); return false; }
 
     int ok = 0, total = 0;
-
-    #define TRY_HOOK(target, hook, orig, name)                    \
-        if (target) { total++;                                    \
-            if (MH_CreateHook(target, (void*)(hook),              \
-                              (void**)&(orig)) == MH_OK) {       \
-                ok++; Log("  Hook %s: OK", name);                 \
-            } else { Log("  Hook %s: FAILED", name); }           \
+    #define TRY_HOOK(target, hook, orig, name) \
+        if (target) { total++; \
+            if (MH_CreateHook(target, (void*)(hook), (void**)&(orig)) == MH_OK) { \
+                ok++; Log("  Hook %s: OK", name); \
+            } else { Log("  Hook %s: FAILED", name); } \
         }
-
     TRY_HOOK(pm, hooked_malloc,  orig_malloc,  "malloc");
     TRY_HOOK(pf, hooked_free,    orig_free,    "free");
     TRY_HOOK(pr, hooked_realloc, orig_realloc, "realloc");
     TRY_HOOK(pc, hooked_calloc,  orig_calloc,  "calloc");
     TRY_HOOK(ps, hooked_msize,   orig_msize,   "_msize");
-
     #undef TRY_HOOK
 
     if (ok == 0) return false;
     if (MH_EnableHook(MH_ALL_HOOKS) != MH_OK) return false;
-
     Log("Allocator hooks: %d/%d active", ok, total);
     return true;
 }
 
 // ================================================================
-// 2. Sleep Hook — Precise Frame Pacing
+// 2. Sleep Hook + Lua GC Stepping
 // ================================================================
+static DWORD g_mainThreadId = 0;
+
 typedef void (WINAPI* Sleep_fn)(DWORD);
 static Sleep_fn orig_Sleep = nullptr;
 
@@ -194,7 +187,6 @@ static void PreciseSleep(double milliseconds) {
     QueryPerformanceFrequency(&freq);
     QueryPerformanceCounter(&start);
     double target = (milliseconds / 1000.0) * freq.QuadPart;
-
     while (true) {
         QueryPerformanceCounter(&now);
         if ((double)(now.QuadPart - start.QuadPart) >= target) break;
@@ -204,6 +196,9 @@ static void PreciseSleep(double milliseconds) {
 
 static void WINAPI hooked_Sleep(DWORD ms) {
     if (ms == 0) { orig_Sleep(0); return; }
+    if (ms <= 3 && g_mainThreadId != 0) {
+        LuaOpt::OnMainThreadSleep(g_mainThreadId);
+    }
     if (ms <= 3) { PreciseSleep((double)ms); return; }
     orig_Sleep(ms);
 }
@@ -213,41 +208,27 @@ static bool InstallSleepHook() {
     if (!p) return false;
     if (MH_CreateHook(p, (void*)hooked_Sleep, (void**)&orig_Sleep) != MH_OK) return false;
     if (MH_EnableHook(p) != MH_OK) return false;
-    Log("Sleep hook: ACTIVE (precise busy-wait for Sleep <= 3ms)");
+    Log("Sleep hook: ACTIVE (precise busy-wait + Lua GC stepping)");
     return true;
 }
 
 // ================================================================
-// 3. TCP_NODELAY — Disable Nagle's Algorithm
+// 3. TCP_NODELAY
 // ================================================================
 typedef int (WINAPI* connect_fn)(SOCKET, const struct sockaddr*, int);
 static connect_fn orig_connect = nullptr;
 
 static int WINAPI hooked_connect(SOCKET s, const struct sockaddr* name, int namelen) {
     int result = orig_connect(s, name, namelen);
-
-    // CRITICAL: save the last error BEFORE calling anything else
-    // WoW checks WSAGetLastError() after connect() returns
-    // If we call setsockopt() it resets the error code and WoW
-    // thinks the connection failed instead of "in progress"
     int savedError = WSAGetLastError();
-
     if (result == 0 || savedError == WSAEWOULDBLOCK) {
         BOOL nodelay = TRUE;
-        setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
-                   (const char*)&nodelay, sizeof(nodelay));
-
+        setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
         int sendbuf = 32768;
-        setsockopt(s, SOL_SOCKET, SO_SNDBUF,
-                   (const char*)&sendbuf, sizeof(sendbuf));
-
+        setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const char*)&sendbuf, sizeof(sendbuf));
         Log("TCP_NODELAY set on socket %d", (int)s);
     }
-
-    // CRITICAL: restore the original error code
-    // so WoW sees WSAEWOULDBLOCK as expected
     WSASetLastError(savedError);
-
     return result;
 }
 
@@ -255,22 +236,16 @@ static bool InstallNetworkHooks() {
     HMODULE h = GetModuleHandleA("ws2_32.dll");
     if (!h) h = LoadLibraryA("ws2_32.dll");
     if (!h) return false;
-
     void* p = (void*)GetProcAddress(h, "connect");
     if (!p) return false;
     if (MH_CreateHook(p, (void*)hooked_connect, (void**)&orig_connect) != MH_OK) return false;
     if (MH_EnableHook(p) != MH_OK) return false;
-
     Log("Network hook: ACTIVE (TCP_NODELAY on all connections)");
     return true;
 }
 
 // ================================================================
 // 4. MPQ Handle Tracking
-//
-// Only MPQ files (read-only archives) should be cached.
-// SavedVariables and config files must NEVER be cached
-// or they will be corrupted on /reload.
 // ================================================================
 static HANDLE g_mpqHandles[256] = {};
 static int    g_mpqHandleCount = 0;
@@ -278,19 +253,14 @@ static CRITICAL_SECTION g_mpqHandleLock;
 
 static void TrackMpqHandle(HANDLE h) {
     EnterCriticalSection(&g_mpqHandleLock);
-    if (g_mpqHandleCount < 256) {
-        g_mpqHandles[g_mpqHandleCount++] = h;
-    }
+    if (g_mpqHandleCount < 256) g_mpqHandles[g_mpqHandleCount++] = h;
     LeaveCriticalSection(&g_mpqHandleLock);
 }
 
 static bool IsMpqHandle(HANDLE h) {
     EnterCriticalSection(&g_mpqHandleLock);
     for (int i = 0; i < g_mpqHandleCount; i++) {
-        if (g_mpqHandles[i] == h) {
-            LeaveCriticalSection(&g_mpqHandleLock);
-            return true;
-        }
+        if (g_mpqHandles[i] == h) { LeaveCriticalSection(&g_mpqHandleLock); return true; }
     }
     LeaveCriticalSection(&g_mpqHandleLock);
     return false;
@@ -299,27 +269,20 @@ static bool IsMpqHandle(HANDLE h) {
 static void UntrackMpqHandle(HANDLE h) {
     EnterCriticalSection(&g_mpqHandleLock);
     for (int i = 0; i < g_mpqHandleCount; i++) {
-        if (g_mpqHandles[i] == h) {
-            g_mpqHandles[i] = g_mpqHandles[--g_mpqHandleCount];
-            break;
-        }
+        if (g_mpqHandles[i] == h) { g_mpqHandles[i] = g_mpqHandles[--g_mpqHandleCount]; break; }
     }
     LeaveCriticalSection(&g_mpqHandleLock);
 }
 
 // ================================================================
-// 5. ReadFile Cache — MPQ-Only Read-Ahead
+// 5. ReadFile Cache (MPQ-only)
 // ================================================================
 typedef BOOL (WINAPI* ReadFile_fn)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED);
 static ReadFile_fn orig_ReadFile = nullptr;
 
 struct ReadCache {
-    HANDLE        handle;
-    uint8_t*      buffer;
-    DWORD         bufferSize;
-    LARGE_INTEGER fileOffset;
-    DWORD         validBytes;
-    bool          active;
+    HANDLE handle; uint8_t* buffer; DWORD bufferSize;
+    LARGE_INTEGER fileOffset; DWORD validBytes; bool active;
 };
 
 static const int   MAX_CACHED_HANDLES = 16;
@@ -329,10 +292,8 @@ static CRITICAL_SECTION g_cacheLock;
 static bool g_cacheInitialized = false;
 
 static ReadCache* FindCache(HANDLE h) {
-    for (int i = 0; i < MAX_CACHED_HANDLES; i++) {
-        if (g_readCache[i].active && g_readCache[i].handle == h)
-            return &g_readCache[i];
-    }
+    for (int i = 0; i < MAX_CACHED_HANDLES; i++)
+        if (g_readCache[i].active && g_readCache[i].handle == h) return &g_readCache[i];
     return nullptr;
 }
 
@@ -340,8 +301,7 @@ static ReadCache* AllocCache(HANDLE h) {
     for (int i = 0; i < MAX_CACHED_HANDLES; i++) {
         if (!g_readCache[i].active) {
             g_readCache[i].handle = h;
-            if (!g_readCache[i].buffer)
-                g_readCache[i].buffer = (uint8_t*)mi_malloc(READ_AHEAD_SIZE);
+            if (!g_readCache[i].buffer) g_readCache[i].buffer = (uint8_t*)mi_malloc(READ_AHEAD_SIZE);
             g_readCache[i].validBytes = 0;
             g_readCache[i].active = true;
             return &g_readCache[i];
@@ -354,13 +314,11 @@ static ReadCache* AllocCache(HANDLE h) {
 }
 
 static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
-                                    DWORD nBytesToRead, LPDWORD lpBytesRead,
-                                    LPOVERLAPPED lpOverlapped) {
-    // Only cache reads from MPQ files (read-only archives)
+    DWORD nBytesToRead, LPDWORD lpBytesRead, LPOVERLAPPED lpOverlapped)
+{
     if (lpOverlapped || !g_cacheInitialized || !IsMpqHandle(hFile) ||
-        nBytesToRead >= READ_AHEAD_SIZE) {
+        nBytesToRead >= READ_AHEAD_SIZE)
         return orig_ReadFile(hFile, lpBuffer, nBytesToRead, lpBytesRead, lpOverlapped);
-    }
 
     EnterCriticalSection(&g_cacheLock);
 
@@ -372,50 +330,38 @@ static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
     }
 
     ReadCache* cache = FindCache(hFile);
-
     if (cache && cache->validBytes > 0) {
         LONGLONG cStart = cache->fileOffset.QuadPart;
         LONGLONG cEnd   = cStart + cache->validBytes;
         LONGLONG rStart = currentPos.QuadPart;
         LONGLONG rEnd   = rStart + nBytesToRead;
-
         if (rStart >= cStart && rEnd <= cEnd) {
             DWORD offset = (DWORD)(rStart - cStart);
             memcpy(lpBuffer, cache->buffer + offset, nBytesToRead);
             if (lpBytesRead) *lpBytesRead = nBytesToRead;
-
-            LARGE_INTEGER newPos;
-            newPos.QuadPart = rEnd;
+            LARGE_INTEGER newPos; newPos.QuadPart = rEnd;
             SetFilePointerEx(hFile, newPos, NULL, FILE_BEGIN);
-
             LeaveCriticalSection(&g_cacheLock);
             return TRUE;
         }
     }
 
     if (!cache) cache = AllocCache(hFile);
-
     if (cache && cache->buffer) {
         cache->fileOffset = currentPos;
         SetFilePointerEx(hFile, currentPos, NULL, FILE_BEGIN);
-
         DWORD bytesRead = 0;
         BOOL ok = orig_ReadFile(hFile, cache->buffer, READ_AHEAD_SIZE, &bytesRead, NULL);
-
         if (ok && bytesRead > 0) {
             cache->validBytes = bytesRead;
             DWORD toCopy = (nBytesToRead < bytesRead) ? nBytesToRead : bytesRead;
             memcpy(lpBuffer, cache->buffer, toCopy);
             if (lpBytesRead) *lpBytesRead = toCopy;
-
-            LARGE_INTEGER newPos;
-            newPos.QuadPart = currentPos.QuadPart + toCopy;
+            LARGE_INTEGER newPos; newPos.QuadPart = currentPos.QuadPart + toCopy;
             SetFilePointerEx(hFile, newPos, NULL, FILE_BEGIN);
-
             LeaveCriticalSection(&g_cacheLock);
             return TRUE;
         }
-
         cache->validBytes = 0;
         SetFilePointerEx(hFile, currentPos, NULL, FILE_BEGIN);
     }
@@ -426,25 +372,21 @@ static BOOL WINAPI hooked_ReadFile(HANDLE hFile, LPVOID lpBuffer,
 
 static bool InstallReadFileHook() {
     g_cacheInitialized = true;
-
     void* p = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "ReadFile");
     if (!p) return false;
     if (MH_CreateHook(p, (void*)hooked_ReadFile, (void**)&orig_ReadFile) != MH_OK) return false;
     if (MH_EnableHook(p) != MH_OK) return false;
-
     Log("ReadFile hook: ACTIVE (MPQ-only cache, 64KB read-ahead, %d slots)", MAX_CACHED_HANDLES);
     return true;
 }
 
 // ================================================================
-// 6. GetTickCount Hook — High-Precision Timer
+// 6. GetTickCount — QPC Precision
 // ================================================================
 typedef DWORD (WINAPI* GetTickCount_fn)(void);
 static GetTickCount_fn orig_GetTickCount = nullptr;
-
-static LARGE_INTEGER g_qpcFreq;
-static LARGE_INTEGER g_qpcStart;
-static DWORD         g_tickStart;
+static LARGE_INTEGER g_qpcFreq, g_qpcStart;
+static DWORD g_tickStart;
 
 static DWORD WINAPI hooked_GetTickCount(void) {
     LARGE_INTEGER now;
@@ -457,18 +399,16 @@ static bool InstallGetTickCountHook() {
     QueryPerformanceFrequency(&g_qpcFreq);
     QueryPerformanceCounter(&g_qpcStart);
     g_tickStart = GetTickCount();
-
     void* p = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetTickCount");
     if (!p) return false;
     if (MH_CreateHook(p, (void*)hooked_GetTickCount, (void**)&orig_GetTickCount) != MH_OK) return false;
     if (MH_EnableHook(p) != MH_OK) return false;
-
     Log("GetTickCount hook: ACTIVE (QPC-based microsecond precision)");
     return true;
 }
 
 // ================================================================
-// 7. CriticalSection Optimization
+// 7. CriticalSection Spin
 // ================================================================
 typedef void (WINAPI* InitCS_fn)(LPCRITICAL_SECTION);
 static InitCS_fn orig_InitCS = nullptr;
@@ -478,126 +418,86 @@ static void WINAPI hooked_InitCS(LPCRITICAL_SECTION lpCS) {
 }
 
 static bool InstallCriticalSectionHook() {
-    void* p = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"),
-                                     "InitializeCriticalSection");
+    void* p = (void*)GetProcAddress(GetModuleHandleA("kernel32.dll"), "InitializeCriticalSection");
     if (!p) return false;
     if (MH_CreateHook(p, (void*)hooked_InitCS, (void**)&orig_InitCS) != MH_OK) return false;
     if (MH_EnableHook(p) != MH_OK) return false;
-
     Log("CriticalSection hook: ACTIVE (spin count 4000)");
     return true;
 }
 
 // ================================================================
-// 8. CreateFile Optimization — Sequential Scan + MPQ Tracking
+// 8. CreateFile — Sequential Scan + MPQ Tracking
 // ================================================================
-typedef HANDLE (WINAPI* CreateFileA_fn)(LPCSTR, DWORD, DWORD,
-    LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-typedef HANDLE (WINAPI* CreateFileW_fn)(LPCWSTR, DWORD, DWORD,
-    LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-
+typedef HANDLE (WINAPI* CreateFileA_fn)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+typedef HANDLE (WINAPI* CreateFileW_fn)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 static CreateFileA_fn orig_CreateFileA = nullptr;
 static CreateFileW_fn orig_CreateFileW = nullptr;
 
-static HANDLE WINAPI hooked_CreateFileA(
-    LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare,
-    LPSECURITY_ATTRIBUTES lpSA, DWORD dwDisposition,
-    DWORD dwFlags, HANDLE hTemplate)
+static HANDLE WINAPI hooked_CreateFileA(LPCSTR lpFileName, DWORD dwAccess, DWORD dwShare,
+    LPSECURITY_ATTRIBUTES lpSA, DWORD dwDisposition, DWORD dwFlags, HANDLE hTemplate)
 {
     bool isMPQ = false;
     if (lpFileName && (dwAccess & GENERIC_READ)) {
         const char* ext = strrchr(lpFileName, '.');
         if (ext && (_stricmp(ext, ".mpq") == 0 || _stricmp(ext, ".MPQ") == 0)) {
-            dwFlags |= FILE_FLAG_SEQUENTIAL_SCAN;
-            isMPQ = true;
+            dwFlags |= FILE_FLAG_SEQUENTIAL_SCAN; isMPQ = true;
         }
     }
-
-    HANDLE result = orig_CreateFileA(lpFileName, dwAccess, dwShare,
-                                      lpSA, dwDisposition, dwFlags, hTemplate);
-
-    if (isMPQ && result != INVALID_HANDLE_VALUE) {
-        TrackMpqHandle(result);
-    }
-
+    HANDLE result = orig_CreateFileA(lpFileName, dwAccess, dwShare, lpSA, dwDisposition, dwFlags, hTemplate);
+    if (isMPQ && result != INVALID_HANDLE_VALUE) TrackMpqHandle(result);
     return result;
 }
 
-static HANDLE WINAPI hooked_CreateFileW(
-    LPCWSTR lpFileName, DWORD dwAccess, DWORD dwShare,
-    LPSECURITY_ATTRIBUTES lpSA, DWORD dwDisposition,
-    DWORD dwFlags, HANDLE hTemplate)
+static HANDLE WINAPI hooked_CreateFileW(LPCWSTR lpFileName, DWORD dwAccess, DWORD dwShare,
+    LPSECURITY_ATTRIBUTES lpSA, DWORD dwDisposition, DWORD dwFlags, HANDLE hTemplate)
 {
     bool isMPQ = false;
     if (lpFileName && (dwAccess & GENERIC_READ)) {
         const wchar_t* ext = wcsrchr(lpFileName, L'.');
         if (ext && (_wcsicmp(ext, L".mpq") == 0 || _wcsicmp(ext, L".MPQ") == 0)) {
-            dwFlags |= FILE_FLAG_SEQUENTIAL_SCAN;
-            isMPQ = true;
+            dwFlags |= FILE_FLAG_SEQUENTIAL_SCAN; isMPQ = true;
         }
     }
-
-    HANDLE result = orig_CreateFileW(lpFileName, dwAccess, dwShare,
-                                      lpSA, dwDisposition, dwFlags, hTemplate);
-
-    if (isMPQ && result != INVALID_HANDLE_VALUE) {
-        TrackMpqHandle(result);
-    }
-
+    HANDLE result = orig_CreateFileW(lpFileName, dwAccess, dwShare, lpSA, dwDisposition, dwFlags, hTemplate);
+    if (isMPQ && result != INVALID_HANDLE_VALUE) TrackMpqHandle(result);
     return result;
 }
 
 static bool InstallFileHooks() {
     HMODULE hK32 = GetModuleHandleA("kernel32.dll");
     if (!hK32) return false;
-
     int ok = 0;
     void* pA = (void*)GetProcAddress(hK32, "CreateFileA");
     void* pW = (void*)GetProcAddress(hK32, "CreateFileW");
-
-    if (pA && MH_CreateHook(pA, (void*)hooked_CreateFileA,
-                             (void**)&orig_CreateFileA) == MH_OK)
+    if (pA && MH_CreateHook(pA, (void*)hooked_CreateFileA, (void**)&orig_CreateFileA) == MH_OK)
         if (MH_EnableHook(pA) == MH_OK) ok++;
-
-    if (pW && MH_CreateHook(pW, (void*)hooked_CreateFileW,
-                             (void**)&orig_CreateFileW) == MH_OK)
+    if (pW && MH_CreateHook(pW, (void*)hooked_CreateFileW, (void**)&orig_CreateFileW) == MH_OK)
         if (MH_EnableHook(pW) == MH_OK) ok++;
-
-    if (ok > 0) {
-        Log("CreateFile hooks: ACTIVE (%d/2, sequential scan + MPQ tracking)", ok);
-        return true;
-    }
+    if (ok > 0) { Log("CreateFile hooks: ACTIVE (%d/2, sequential scan + MPQ tracking)", ok); return true; }
     return false;
 }
 
 // ================================================================
-// 9. CloseHandle Hook — Cache Invalidation
+// 9. CloseHandle — Cache Invalidation
 // ================================================================
 typedef BOOL (WINAPI* CloseHandle_fn)(HANDLE);
 static CloseHandle_fn orig_CloseHandle = nullptr;
 
 static BOOL WINAPI hooked_CloseHandle(HANDLE hObject) {
     if (!hObject || hObject == INVALID_HANDLE_VALUE ||
-        hObject == GetCurrentProcess() || hObject == GetCurrentThread()) {
+        hObject == GetCurrentProcess() || hObject == GetCurrentThread())
         return orig_CloseHandle(hObject);
-    }
-
-    if (g_mpqHandleCount > 0) {
-        UntrackMpqHandle(hObject);
-    }
-
+    if (g_mpqHandleCount > 0) UntrackMpqHandle(hObject);
     if (g_cacheInitialized) {
         EnterCriticalSection(&g_cacheLock);
         for (int i = 0; i < MAX_CACHED_HANDLES; i++) {
             if (g_readCache[i].active && g_readCache[i].handle == hObject) {
-                g_readCache[i].active = false;
-                g_readCache[i].validBytes = 0;
-                break;
+                g_readCache[i].active = false; g_readCache[i].validBytes = 0; break;
             }
         }
         LeaveCriticalSection(&g_cacheLock);
     }
-
     return orig_CloseHandle(hObject);
 }
 
@@ -615,13 +515,10 @@ static bool InstallCloseHandleHook() {
 // ================================================================
 static void SetHighTimerResolution() {
     typedef LONG (WINAPI* NtSetTimerRes_fn)(ULONG, BOOLEAN, PULONG);
-
     HMODULE h = GetModuleHandleA("ntdll.dll");
     if (!h) return;
-
     auto p = (NtSetTimerRes_fn)GetProcAddress(h, "NtSetTimerResolution");
     if (!p) return;
-
     ULONG actual;
     if (p(5000, TRUE, &actual) == 0)
         Log("Timer resolution: %.3f ms (requested 0.500 ms)", actual / 10000.0);
@@ -630,32 +527,22 @@ static void SetHighTimerResolution() {
 }
 
 // ================================================================
-// 11. Large Memory Pages
+// 11. Large Pages
 // ================================================================
 static void TryEnableLargePages() {
     HANDLE hToken;
-    if (!OpenProcessToken(GetCurrentProcess(),
-                          TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
-        return;
-
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) return;
     TOKEN_PRIVILEGES tp = {};
     tp.PrivilegeCount = 1;
     tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-    if (!LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege",
-                                &tp.Privileges[0].Luid)) {
-        CloseHandle(hToken);
-        return;
+    if (!LookupPrivilegeValueA(NULL, "SeLockMemoryPrivilege", &tp.Privileges[0].Luid)) {
+        CloseHandle(hToken); return;
     }
-
     AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
     CloseHandle(hToken);
-
     if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
-        Log("Large pages: no permission (need 'Lock pages in memory' policy)");
-        return;
+        Log("Large pages: no permission (need 'Lock pages in memory' policy)"); return;
     }
-
     mi_option_set(mi_option_allow_large_os_pages, 1);
     Log("Large pages: enabled for mimalloc");
 }
@@ -667,10 +554,8 @@ static void OptimizeThreads() {
     DWORD pid = GetCurrentProcessId();
     DWORD mainTid = 0;
     ULONGLONG earliest = MAXULONGLONG;
-
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return;
-
     THREADENTRY32 te = { sizeof(te) };
     if (Thread32First(hSnap, &te)) {
         do {
@@ -688,27 +573,22 @@ static void OptimizeThreads() {
         } while (Thread32Next(hSnap, &te));
     }
     CloseHandle(hSnap);
-
     if (!mainTid) { Log("WARNING: Could not find main thread"); return; }
 
-    HANDLE hMain = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
-                               FALSE, mainTid);
+    g_mainThreadId = mainTid;
+
+    HANDLE hMain = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, mainTid);
     if (!hMain) return;
-
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
+    SYSTEM_INFO si; GetSystemInfo(&si);
     DWORD core = (si.dwNumberOfProcessors > 2) ? 1 : 0;
-
     SetThreadIdealProcessor(hMain, core);
     SetThreadPriority(hMain, THREAD_PRIORITY_HIGHEST);
     CloseHandle(hMain);
-
-    Log("Main thread %lu: ideal core %lu, priority HIGHEST (of %lu cores)",
-        mainTid, core, si.dwNumberOfProcessors);
+    Log("Main thread %lu: ideal core %lu, priority HIGHEST (of %lu cores)", mainTid, core, si.dwNumberOfProcessors);
 }
 
 // ================================================================
-// 13. Process-Level Optimization
+// 13. Process Priority
 // ================================================================
 static void OptimizeProcess() {
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
@@ -717,12 +597,11 @@ static void OptimizeProcess() {
 }
 
 // ================================================================
-// 14. Working Set Optimization
+// 14. Working Set
 // ================================================================
 static void OptimizeWorkingSet() {
     SIZE_T minWS = 256 * 1024 * 1024;
     SIZE_T maxWS = 2048ULL * 1024 * 1024;
-
     if (SetProcessWorkingSetSize(GetCurrentProcess(), minWS, maxWS))
         Log("Working set: min 256 MB, max 2048 MB");
     else
@@ -735,27 +614,19 @@ static void OptimizeWorkingSet() {
 static void ConfigureMimalloc() {
     mi_option_set(mi_option_allow_large_os_pages, 1);
     mi_option_set(mi_option_purge_delay, 0);
-
     void* warmup = mi_malloc(64 * 1024 * 1024);
-    if (warmup) {
-        memset(warmup, 0, 64 * 1024 * 1024);
-        mi_free(warmup);
-    }
-
+    if (warmup) { memset(warmup, 0, 64 * 1024 * 1024); mi_free(warmup); }
     Log("mimalloc configured (large pages, pre-warmed 64MB)");
 }
 
 // ================================================================
 // 16. FPS Cap Removal
 // ================================================================
-static uintptr_t FindPattern(uintptr_t base, size_t size,
-                              const uint8_t* pat, const char* mask) {
+static uintptr_t FindPattern(uintptr_t base, size_t size, const uint8_t* pat, const char* mask) {
     for (size_t i = 0; i < size; i++) {
         bool found = true;
         for (size_t j = 0; mask[j]; j++) {
-            if (mask[j] == 'x' && *(uint8_t*)(base + i + j) != pat[j]) {
-                found = false; break;
-            }
+            if (mask[j] == 'x' && *(uint8_t*)(base + i + j) != pat[j]) { found = false; break; }
         }
         if (found) return base + i;
     }
@@ -765,14 +636,10 @@ static uintptr_t FindPattern(uintptr_t base, size_t size,
 static void TryRemoveFPSCap() {
     HMODULE hWow = GetModuleHandleA(NULL);
     if (!hWow) return;
-
     MODULEINFO modInfo;
-    if (!GetModuleInformation(GetCurrentProcess(), hWow, &modInfo, sizeof(modInfo)))
-        return;
-
+    if (!GetModuleInformation(GetCurrentProcess(), hWow, &modInfo, sizeof(modInfo))) return;
     const uint8_t pat[] = { 0x3D, 0xC8, 0x00, 0x00, 0x00 };
     uintptr_t addr = FindPattern((uintptr_t)hWow, modInfo.SizeOfImage, pat, "xxxxx");
-
     if (addr) {
         DWORD old;
         if (VirtualProtect((void*)(addr + 1), 4, PAGE_EXECUTE_READWRITE, &old)) {
@@ -786,25 +653,20 @@ static void TryRemoveFPSCap() {
 }
 
 // ================================================================
-// Main initialization thread
+// Main Thread
 // ================================================================
 static DWORD WINAPI MainThread(LPVOID param) {
     Sleep(5000);
 
     LogOpen();
     Log("========================================");
-    Log("  wow_optimize.dll v1.1 BY SUPREMATIST");
+    Log("  wow_optimize.dll v1.2 BY SUPREMATIST");
     Log("  PID: %lu", GetCurrentProcessId());
     Log("========================================");
 
-    if (MH_Initialize() != MH_OK) {
-        Log("FATAL: MinHook initialization failed");
-        LogClose();
-        return 1;
-    }
+    if (MH_Initialize() != MH_OK) { Log("FATAL: MinHook initialization failed"); LogClose(); return 1; }
     Log("MinHook initialized");
 
-    // Initialize critical sections BEFORE any hooks that use them
     InitializeCriticalSection(&g_mpqHandleLock);
     InitializeCriticalSection(&g_cacheLock);
 
@@ -817,58 +679,55 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     Log("--- Frame Pacing ---");
     bool sleepOk = InstallSleepHook();
-
     Log("--- Timer Precision ---");
     bool tickOk = InstallGetTickCountHook();
-
     Log("--- Critical Sections ---");
     bool csOk = InstallCriticalSectionHook();
-
     Log("--- Network ---");
     bool netOk = InstallNetworkHooks();
-
     Log("--- File I/O ---");
     bool fileOk = InstallFileHooks();
     bool readOk = InstallReadFileHook();
     bool closeOk = InstallCloseHandleHook();
-
     Log("--- System Timer ---");
     SetHighTimerResolution();
-
     Log("--- Threads ---");
     OptimizeThreads();
-
     Log("--- Process ---");
     OptimizeProcess();
     OptimizeWorkingSet();
-
     Log("--- FPS Cap ---");
     TryRemoveFPSCap();
+
+    Log("");
+    Log("--- Lua VM Optimizer ---");
+    bool luaOk = LuaOpt::PrepareFromWorkerThread();
 
     Log("");
     Log("========================================");
     Log("  Initialization complete");
     Log("========================================");
     Log("");
-    Log("  [%s] mimalloc allocator",            allocOk ? " OK " : "FAIL");
-    Log("  [%s] Sleep hook (frame pacing)",     sleepOk ? " OK " : "FAIL");
-    Log("  [%s] GetTickCount (precision)",      tickOk  ? " OK " : "FAIL");
-    Log("  [%s] CriticalSection (spin lock)",   csOk    ? " OK " : "FAIL");
-    Log("  [%s] TCP_NODELAY (network)",         netOk   ? " OK " : "FAIL");
-    Log("  [%s] CreateFile (sequential I/O)",   fileOk  ? " OK " : "FAIL");
-    Log("  [%s] ReadFile (MPQ read-ahead)",     readOk  ? " OK " : "FAIL");
-    Log("  [%s] CloseHandle (cache cleanup)",   closeOk ? " OK " : "FAIL");
+    Log("  [%s] mimalloc allocator",         allocOk ? " OK " : "FAIL");
+    Log("  [%s] Sleep hook (frame pacing)",  sleepOk ? " OK " : "FAIL");
+    Log("  [%s] GetTickCount (precision)",   tickOk  ? " OK " : "FAIL");
+    Log("  [%s] CriticalSection (spin lock)",csOk    ? " OK " : "FAIL");
+    Log("  [%s] TCP_NODELAY (network)",      netOk   ? " OK " : "FAIL");
+    Log("  [%s] CreateFile (sequential I/O)",fileOk  ? " OK " : "FAIL");
+    Log("  [%s] ReadFile (MPQ read-ahead)",  readOk  ? " OK " : "FAIL");
+    Log("  [%s] CloseHandle (cache cleanup)",closeOk ? " OK " : "FAIL");
     Log("  [ OK ] Timer resolution (0.5ms)");
     Log("  [ OK ] Thread affinity + priority");
     Log("  [ OK ] Working set (256MB-2GB)");
     Log("  [ OK ] Process priority (Above Normal)");
     Log("  [ OK ] FPS cap removal (200 -> 999)");
+    Log("  [%s] Lua VM GC optimizer",        luaOk  ? "WAIT" : "SKIP");
 
     return 0;
 }
 
 // ================================================================
-// DLL entry point
+// DLL Entry Point
 // ================================================================
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
     switch (reason) {
@@ -876,22 +735,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             DisableThreadLibraryCalls(hModule);
             CreateThread(NULL, 0, MainThread, NULL, 0, NULL);
             break;
-
         case DLL_PROCESS_DETACH:
+            LuaOpt::Shutdown();
             MH_DisableHook(MH_ALL_HOOKS);
             MH_Uninitialize();
-
             for (int i = 0; i < MAX_CACHED_HANDLES; i++) {
-                if (g_readCache[i].buffer) {
-                    mi_free(g_readCache[i].buffer);
-                    g_readCache[i].buffer = nullptr;
-                }
+                if (g_readCache[i].buffer) { mi_free(g_readCache[i].buffer); g_readCache[i].buffer = nullptr; }
             }
-            if (g_cacheInitialized) {
-                DeleteCriticalSection(&g_cacheLock);
-                DeleteCriticalSection(&g_mpqHandleLock);
-            }
-
+            if (g_cacheInitialized) { DeleteCriticalSection(&g_cacheLock); DeleteCriticalSection(&g_mpqHandleLock); }
             Log("wow_optimize.dll unloaded");
             LogClose();
             break;
