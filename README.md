@@ -283,8 +283,27 @@ What this DLL **does**:
 
 ## 🐛 Troubleshooting
 
+### Proxy `version.dll` not loading
+
+**Symptom:** You placed `version.dll` and `wow_optimize.dll` next to `Wow.exe`, but no `wow_optimize.log` is created on launch — the DLL is not being picked up.
+
+**Fix:** Disable fullscreen optimizations for `Wow.exe`:
+
+1. Right-click `Wow.exe` → **Properties**
+2. Go to the **Compatibility** tab
+3. ✅ Check **"Disable fullscreen optimizations"**
+4. Click **Apply** → **OK**
+5. Relaunch WoW
+
+> Windows fullscreen optimizations can interfere with how the application loads DLLs from its working directory. Disabling this feature forces Windows to use the classic DLL search order, allowing the proxy `version.dll` to be loaded correctly.
+
+![Disable fullscreen optimizations](screenshots/wow.exe%20properties.png)
+
+---
+
 | Problem | Solution |
 |---------|----------|
+| Proxy DLL doesn't load (no log file) | See above — disable fullscreen optimizations on `Wow.exe` |
 | WoW crashes after injection | Wait for login screen + 10 seconds before injecting |
 | `FATAL: MinHook initialization failed` | Another hook DLL conflicting |
 | `ERROR: No CRT DLL found` | Non-standard WoW build |
