@@ -101,6 +101,9 @@ When both are installed, the DLL handles Lua allocator replacement and GC steppi
 
 ---
 
+## 📹 Video Demonstation (Outdated)
+[Video Demonstation of first version](https://www.youtube.com/watch?v=mDswd1cGJ24)
+
 ## 📦 Building
 
 ### Requirements
