@@ -25,8 +25,10 @@ FetchContent_MakeAvailable(mimalloc)
 # === Main optimization DLL ===
 add_library(wow_optimize SHARED
     src/dllmain.cpp
-    src/lua_optimize.cpp      
-    src/lua_optimize.h        
+    src/lua_optimize.cpp
+    src/lua_optimize.h
+    src/combatlog_optimize.cpp
+    src/combatlog_optimize.h
 )
 
 target_link_libraries(wow_optimize PRIVATE

@@ -1,8 +1,8 @@
-# 🚀 wow_optimize v1.3.0 BY SUPREMATIST
+# 🚀 wow_optimize v1.4.0 BY SUPREMATIST
 
 **Performance optimization DLL for World of Warcraft 3.3.5a (WotLK)**
 
-Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threading, frame pacing, and Lua VM — all through a single injectable DLL.
+Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threading, frame pacing, Lua VM, and combat log buffer — all through a single injectable DLL.
 
 > ⚠️ **Disclaimer:** This project is provided as-is for educational purposes. DLL injection may violate the Terms of Service of private servers. **No ban has been reported**, but **use at your own risk.** The author is not responsible for any consequences including but not limited to account suspensions.
 
@@ -13,7 +13,7 @@ Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threadi
 | # | Feature | What It Does |
 |---|---------|--------------|
 | 1 | **mimalloc Allocator** | Replaces msvcr80/ucrtbase `malloc`/`free` with Microsoft's modern allocator |
-| 2 | **Lua VM Allocator** | Replaces WoW's internal Lua pool allocator with mimalloc (v1.3.0) |
+| 2 | **Lua VM Allocator** | Replaces WoW's internal Lua pool allocator with mimalloc |
 | 3 | **Sleep Hook** | Precise frame pacing via QPC busy-wait (eliminates Sleep jitter) |
 | 4 | **TCP\_NODELAY** | Disables Nagle's algorithm on all sockets (lower ping) |
 | 5 | **GetTickCount Hook** | QPC-based microsecond precision (better internal timers) |
@@ -27,33 +27,31 @@ Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threadi
 | 13 | **Process Priority** | Above Normal + disabled priority boost |
 | 14 | **FPS Cap Removal** | Raises hardcoded 200 FPS limit to 999 |
 | 15 | **Lua VM GC Optimizer** | 4-tier per-frame GC stepping from C (loading/combat/idle/normal) |
+| 16 | **Combat Log Optimizer** | Prevents combat log data loss in raids (retention + anti-recycle + cleanup) |
 
 ---
 
-## 🆕 What's New in v1.3.0
+## 🆕 What's New in v1.4.0
 
-### Lua Allocator Replacement (major)
+### Combat Log Buffer Optimizer
 
-WoW's Lua VM uses a **custom pool allocator** with 9 size buckets + SMemAlloc fallback. Neither path goes through CRT malloc — meaning the previous mimalloc hooks **didn't cover Lua allocations at all**.
+Fixes the "combat log breaks" problem in 25-man raids where addons like Skada, Recount, and Details lose data during heavy combat.
 
-Now the DLL replaces the `frealloc` pointer inside Lua's `global_State`:
-- All new Lua allocations (strings, tables, closures, userdata) go through **mimalloc**
-- Old pointers from WoW's pool are freed via the original allocator (safe transition)
-- Automatic re-application after `/reload`
-- Stats tracking with periodic logging
+**Root cause:** WoW stores combat log events in a linked list. When the internal free list is empty and a new event arrives, the allocator checks if the oldest entry has expired (based on `combatLogRetentionTime` CVar, default 300 seconds). If it has, the entry is **recycled** — even if Lua hasn't processed it yet. This means the `COMBAT_LOG_EVENT_UNFILTERED` event never fires for that entry, and damage meter addons miss it.
 
-**Impact:** Every `table.insert`, `string.format`, closure creation, and addon data structure now benefits from mimalloc's faster allocation and lower fragmentation.
+**Three fixes applied:**
 
-### 4-Tier GC Stepping
+| Fix | What | Why |
+|-----|------|-----|
+| **Retention 300→900 sec** | Entries survive 15 minutes instead of 5 | More time for Lua to process during heavy combat bursts |
+| **Disable recycling** | Patch `js` → `jmp` in entry allocator | Allocator always creates new nodes instead of recycling unprocessed ones |
+| **Periodic cleanup** | Frees expired entries from C every ~30 sec | Replaces CombatLogFix addon. Respects Lua processing boundary — never frees unprocessed entries |
 
-GC step size now adapts to game state:
-
-| Mode | Step Size | When |
-|------|-----------|------|
-| **Loading** | 256 KB/frame | During loading screens (no rendering) |
-| **Combat** | 16 KB/frame | In combat (protect frametime) |
-| **Idle** | 128 KB/frame | AFK / no activity |
-| **Normal** | 64 KB/frame | Default gameplay |
+**Impact:**
+- ✅ No more "combat log breaks" in ICC/RS 25-man
+- ✅ Skada/Recount/Details show accurate data throughout the fight
+- ✅ Replaces CombatLogFix addon (no Lua overhead)
+- ✅ ~5-10 MB extra RAM usage (negligible)
 
 ---
 
@@ -70,6 +68,7 @@ This is **not** a magic FPS doubler. Think of it like replacing an HDD with an S
 - ✅ Lower network latency (spells feel more responsive)
 - ✅ Faster zone loading
 - ✅ Reduced lag spikes on boss kills and dungeon queue pops
+- ✅ No more broken damage meters in 25-man raids
 
 ### You WON'T notice
 
@@ -83,6 +82,7 @@ This is **not** a magic FPS doubler. Think of it like replacing an HDD with an S
 - ⚔️ 25-man raids (ICC, RS) with heavy addon usage
 - ⏱️ Long play sessions without restarting the client
 - 🌐 High-latency connections (TCP\_NODELAY helps most here)
+- 📊 Damage meters during intense AoE fights
 
 ---
 
@@ -92,17 +92,19 @@ For maximum optimization, use this DLL together with the **[!LuaBoost](https://g
 
 | Layer | Tool | What It Does |
 |-------|------|--------------|
-| **C / Engine** | wow\_optimize.dll | Faster memory, I/O, network, timers, Lua allocator + GC from C |
+| **C / Engine** | wow\_optimize.dll | Faster memory, I/O, network, timers, Lua allocator + GC from C, combat log fix |
 | **Lua / Addons** | !LuaBoost addon | Faster math/table, incremental GC, SpeedyLoad, table pool, throttle API |
 
-When both are installed, the DLL handles Lua allocator replacement and GC stepping from C (zero Lua overhead) and communicates with the addon via shared globals. The addon provides the GUI, combat awareness, idle detection, SpeedyLoad, and runtime function optimizations.
+When both are installed, the DLL handles Lua allocator replacement, GC stepping from C (zero Lua overhead), and combat log buffering. The addon provides the GUI, combat awareness, idle detection, SpeedyLoad, and runtime function optimizations.
 
 > ⚠️ **Do NOT use [SmartGC](https://github.com/suprepupre/SmartGC) together with !LuaBoost** — SmartGC has been merged into LuaBoost. Using both will cause conflicts.
 
+> ⚠️ **You can remove the CombatLogFix addon** if you're using wow_optimize.dll v1.4.0+ — the DLL handles combat log cleanup from C level without Lua overhead.
+
 ---
 
-## 📹 Video Demonstation (Outdated)
-[Video Demonstation of first version](https://www.youtube.com/watch?v=mDswd1cGJ24)
+## 📹 Video Demonstration (Outdated)
+[Video Demonstration of first version](https://www.youtube.com/watch?v=mDswd1cGJ24)
 
 ## 📦 Building
 
@@ -115,9 +117,11 @@ When both are installed, the DLL handles Lua allocator replacement and GC steppi
 
 ### Build Steps
 
+```
 git clone https://github.com/suprepupre/wow-optimize.git
 cd wow-optimize
 build.bat
+```
 
 Output: `build\Release\wow_optimize.dll` + `build\Release\version.dll`
 
@@ -125,10 +129,12 @@ Output: `build\Release\wow_optimize.dll` + `build\Release\version.dll`
 
 ### Manual Build
 
+```
 mkdir build
 cd build
 cmake -G "Visual Studio 17 2022" -A Win32 ..
 cmake --build . --config Release
+```
 
 ---
 
@@ -158,13 +164,13 @@ Check `wow_optimize.log` — all lines should show `[ OK ]`.
 
 ```
 [02:42:28.155] ========================================
-[02:42:28.155]   wow_optimize.dll v1.3.0 BY SUPREMATIST
+[02:42:28.155]   wow_optimize.dll v1.4.0 BY SUPREMATIST
 [02:42:28.155]   PID: 13088
 [02:42:28.155] ========================================
 [02:42:28.155] MinHook initialized
 [02:42:28.165] mimalloc configured (large pages, pre-warmed 64MB)
 [02:42:28.183] >>> ALLOCATOR: mimalloc ACTIVE <<<
-[02:42:28.197] Sleep hook: ACTIVE (precise busy-wait + Lua GC stepping)
+[02:42:28.197] Sleep hook: ACTIVE (frame pacing + Lua GC + combat log)
 [02:42:28.215] GetTickCount hook: ACTIVE
 [02:42:28.238] CriticalSection hook: ACTIVE
 [02:42:28.254] Network hook: ACTIVE
@@ -177,19 +183,21 @@ Check `wow_optimize.log` — all lines should show `[ OK ]`.
 [02:42:28.338] Working set: min 256 MB, max 2048 MB
 [02:42:28.338] FPS cap: changed from 200 to 999
 [02:42:28.339]   [WAIT] Lua VM GC optimizer
+[02:42:28.340]
+[02:42:28.340] [CombatLog] ====================================
+[02:42:28.340] [CombatLog]  Combat Log Buffer Optimizer
+[02:42:28.340] [CombatLog]  Build 12340
+[02:42:28.340] [CombatLog] ====================================
+[02:42:28.340] [CombatLog] Current retention: 300 sec
+[02:42:28.340] [CombatLog] Retention: 300 -> 900 sec
+[02:42:28.340] [CombatLog] Retention recycling disabled (0x0075043D: js -> jmp)
+[02:42:28.340] [CombatLog]  [ OK ] Retention time (300 -> 900 sec)
+[02:42:28.340] [CombatLog]  [ OK ] Prevent entry recycling
+[02:42:28.340] [CombatLog]  [ OK ] Periodic cleanup (every 1800 frames)
+[02:42:28.340] [CombatLog] ====================================
 [02:42:38.789]
 [02:42:38.789] [LuaOpt] lua_State* = 0x18D68A68
 [02:42:38.789] [LuaOpt-Alloc]  >>> ALLOCATOR REPLACED <<<
-[02:42:38.789] [LuaOpt-Alloc]  Old: 0x008558E0 (WoW pool + SMemAlloc)
-[02:42:38.789] [LuaOpt-Alloc]  New: 0x68842750 (mimalloc)
-[02:42:38.789] [LuaOpt]  Init Complete
-[02:42:38.789] [LuaOpt]    Lua allocator:    mimalloc (REPLACED)
-[02:42:38.789] [LuaOpt]    GC optimized:     YES
-[02:42:38.789] [LuaOpt]    GC tiers (KB/f):
-[02:42:38.789] [LuaOpt]      normal  = 64
-[02:42:38.789] [LuaOpt]      combat  = 16
-[02:42:38.789] [LuaOpt]      idle    = 128
-[02:42:38.789] [LuaOpt]      loading = 256
 ```
 
 ### Uninstall
@@ -200,7 +208,7 @@ Delete `version.dll` (and `wow_optimize.dll`) from WoW folder.
 
 ## 🧠 Lua VM Optimizer
 
-### Lua Allocator Replacement (v1.3.0)
+### Lua Allocator Replacement
 
 WoW's Lua 5.1 uses a custom allocator (0x008558E0) with:
 
@@ -242,6 +250,50 @@ DLL reads addon globals per-frame from the Sleep hook (main thread).
 
 ---
 
+## 📊 Combat Log Optimizer
+
+### The Problem
+
+In 25-man raids (ICC, RS) with addons like DBM, WeakAuras, and Skada running simultaneously, the combat log loses events. Damage meters show incomplete data, often called "combat log breaks."
+
+### How WoW's Combat Log Works
+
+```
+Active List:  HEAD → [entry1] → [entry2] → ... → [entryN]
+                      oldest                       newest
+                         ↑                            ↑
+                    may be recycled              CA1394 (Lua pending)
+
+Free List:    HEAD → [recycled1] → [recycled2] → ...
+```
+
+Events are stored as a linked list. Each entry is ~120 bytes with timestamp, GUIDs, spell info, and event flags. When a new event arrives:
+
+1. Check free list → reuse a recycled node
+2. Free list empty → check if oldest entry expired (age > retention × 1000ms)
+3. Expired → **recycle it** (even if Lua hasn't processed it!)
+4. Not expired → allocate new node from heap
+
+Step 3 is the bug: if `CA1394` (the Lua processing pointer) points to the entry being recycled, the pointer advances past it and `COMBAT_LOG_EVENT_UNFILTERED` never fires.
+
+### The Fix
+
+| Patch | Address | What |
+|-------|---------|------|
+| Retention | CVar at `BD09F0+0x30` | 300 → 900 seconds. Entries survive longer. |
+| Anti-recycle | `0x75043D`: `js` → `jmp` | Allocator always creates new nodes. Never recycles unprocessed entries. |
+| Cleanup | From Sleep hook | Walks active list every ~30 sec. Frees expired entries that Lua has already processed. |
+
+### Memory Impact
+
+At 500 events/sec × 120 bytes × 900 sec retention = ~54 MB worst case. In practice much less because the periodic cleanup frees processed entries continuously.
+
+### Replacing CombatLogFix Addon
+
+If you use the CombatLogFix addon (from KPack or standalone), you can **remove it**. The DLL does the same job from C level without any Lua overhead. The addon just calls `CombatLogClearEntries()` on a timer — the DLL does smarter cleanup that respects the Lua processing boundary.
+
+---
+
 ## 🧠 Technical Details
 
 ### Safe Allocator Transition
@@ -262,6 +314,19 @@ After replacement:   Lua alloc → mimalloc
                      Lua free  → checks which heap owns the pointer
                                  ├── mimalloc     → mi_free()
                                  └── WoW pool/SMem → original frealloc()
+```
+
+### Combat Log Entry Lifecycle
+
+```
+New event → sub_750400 (alloc)
+         → sub_86E200 (insert into active list)
+         → sub_74F910 (push to Lua via CA1394)
+         → addon processes COMBAT_LOG_EVENT_UNFILTERED
+         → CA1394 advances to next entry
+         ...
+         → DLL cleanup: entry expired + already processed → sub_750390 (free)
+         → entry moves to free list for reuse
 ```
 
 ### CRT Auto-Detection
@@ -302,6 +367,7 @@ What this DLL **does**:
 
 - ✅ Hooks system-level functions (`malloc`, `free`, `Sleep`, `connect`, `ReadFile`)
 - ✅ Calls Lua VM GC API for performance tuning (read-only stats + GC stepping)
+- ✅ Patches combat log retention and recycling (write to CVar value + 1 byte code patch)
 
 ### System Requirements
 
@@ -340,7 +406,10 @@ What this DLL **does**:
 | Lua optimizer shows `SKIP` | Lua addresses not found (different build?) |
 | `Invalid function pointer` crash | Old DLL version — update to v1.2+ |
 | `Large pages: no permission` | Normal — requires admin policy change, optional |
-| No noticeable difference | Expected on high-end PCs |
+| Combat log shows `SKIP` | CVar pointer not valid yet — try injecting later |
+| Combat log `Expected 0x78` error | Different client build — recycle patch skipped (retention patch still works) |
+| Damage meters still broken | Remove CombatLogFix addon if present — two fixers may conflict |
+| No noticeable difference | Expected on high-end PCs with few addons |
 
 ---
 
@@ -349,14 +418,16 @@ What this DLL **does**:
 ```
 wow-optimize/
 ├── src/
-│   ├── dllmain.cpp          # Main DLL — all system hooks
-│   ├── lua_optimize.cpp     # Lua VM optimizer (allocator + GC + communication)
-│   ├── lua_optimize.h       # Lua optimizer interface
-│   ├── version_proxy.cpp    # Auto-loader (version.dll proxy)
-│   ├── version_exports.def  # Export definitions for version.dll
-│   └── version.rc           # DLL version info resource
-├── CMakeLists.txt           # Build config + dependency management
-├── build.bat                # One-click build script
+│   ├── dllmain.cpp              # Main DLL — all system hooks
+│   ├── lua_optimize.cpp         # Lua VM optimizer (allocator + GC + communication)
+│   ├── lua_optimize.h           # Lua optimizer interface
+│   ├── combatlog_optimize.cpp   # Combat log buffer optimizer
+│   ├── combatlog_optimize.h     # Combat log optimizer interface
+│   ├── version_proxy.cpp        # Auto-loader (version.dll proxy)
+│   ├── version_exports.def      # Export definitions for version.dll
+│   └── version.rc               # DLL version info resource
+├── CMakeLists.txt               # Build config + dependency management
+├── build.bat                    # One-click build script
 ├── README.md
 ├── LICENSE
 └── .gitignore

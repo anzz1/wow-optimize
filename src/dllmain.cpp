@@ -1,5 +1,5 @@
 // ================================================================
-//  wow_optimize.dll v1.2 BY SUPREMATIST
+//  wow_optimize.dll v1.4.0 BY SUPREMATIST
 //  Performance optimization DLL for World of Warcraft 3.3.5a
 //
 //  Features:
@@ -16,7 +16,8 @@
 //    11. Working set locking (prevent page-outs)
 //    12. FPS cap removal (200 -> 999)
 //    13. Process priority optimization
-//    14. Lua VM GC optimizer (per-frame stepping, allocator) 
+//    14. Lua VM GC optimizer (per-frame stepping, allocator)
+//    15. Combat log buffer optimizer (retention, anti-recycle)
 //
 //  Must be compiled as 32-bit (x86).
 //  WoW 3.3.5a is a 32-bit application.
@@ -44,6 +45,7 @@
 #include "MinHook.h"
 #include <mimalloc.h>
 #include "lua_optimize.h"
+#include "combatlog_optimize.h"
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ws2_32.lib")
@@ -175,7 +177,7 @@ static bool InstallAllocatorHooks() {
 }
 
 // ================================================================
-// 2. Sleep Hook + Lua GC Stepping
+// 2. Sleep Hook + Lua GC Stepping + Combat Log Cleanup
 // ================================================================
 static DWORD g_mainThreadId = 0;
 
@@ -196,9 +198,12 @@ static void PreciseSleep(double milliseconds) {
 
 static void WINAPI hooked_Sleep(DWORD ms) {
     if (ms == 0) { orig_Sleep(0); return; }
+
     if (ms <= 3 && g_mainThreadId != 0) {
         LuaOpt::OnMainThreadSleep(g_mainThreadId);
+        CombatLogOpt::OnFrame(g_mainThreadId);
     }
+
     if (ms <= 3) { PreciseSleep((double)ms); return; }
     orig_Sleep(ms);
 }
@@ -208,7 +213,7 @@ static bool InstallSleepHook() {
     if (!p) return false;
     if (MH_CreateHook(p, (void*)hooked_Sleep, (void**)&orig_Sleep) != MH_OK) return false;
     if (MH_EnableHook(p) != MH_OK) return false;
-    Log("Sleep hook: ACTIVE (precise busy-wait + Lua GC stepping)");
+    Log("Sleep hook: ACTIVE (frame pacing + Lua GC + combat log)");
     return true;
 }
 
@@ -704,24 +709,29 @@ static DWORD WINAPI MainThread(LPVOID param) {
     bool luaOk = LuaOpt::PrepareFromWorkerThread();
 
     Log("");
+    Log("--- Combat Log ---");
+    bool combatLogOk = CombatLogOpt::Init();
+
+    Log("");
     Log("========================================");
     Log("  Initialization complete");
     Log("========================================");
     Log("");
-    Log("  [%s] mimalloc allocator",         allocOk ? " OK " : "FAIL");
-    Log("  [%s] Sleep hook (frame pacing)",  sleepOk ? " OK " : "FAIL");
-    Log("  [%s] GetTickCount (precision)",   tickOk  ? " OK " : "FAIL");
-    Log("  [%s] CriticalSection (spin lock)",csOk    ? " OK " : "FAIL");
-    Log("  [%s] TCP_NODELAY (network)",      netOk   ? " OK " : "FAIL");
-    Log("  [%s] CreateFile (sequential I/O)",fileOk  ? " OK " : "FAIL");
-    Log("  [%s] ReadFile (MPQ read-ahead)",  readOk  ? " OK " : "FAIL");
-    Log("  [%s] CloseHandle (cache cleanup)",closeOk ? " OK " : "FAIL");
+    Log("  [%s] mimalloc allocator",          allocOk     ? " OK " : "FAIL");
+    Log("  [%s] Sleep hook (frame pacing)",   sleepOk     ? " OK " : "FAIL");
+    Log("  [%s] GetTickCount (precision)",    tickOk      ? " OK " : "FAIL");
+    Log("  [%s] CriticalSection (spin lock)", csOk        ? " OK " : "FAIL");
+    Log("  [%s] TCP_NODELAY (network)",       netOk       ? " OK " : "FAIL");
+    Log("  [%s] CreateFile (sequential I/O)", fileOk      ? " OK " : "FAIL");
+    Log("  [%s] ReadFile (MPQ read-ahead)",   readOk      ? " OK " : "FAIL");
+    Log("  [%s] CloseHandle (cache cleanup)", closeOk     ? " OK " : "FAIL");
     Log("  [ OK ] Timer resolution (0.5ms)");
     Log("  [ OK ] Thread affinity + priority");
     Log("  [ OK ] Working set (256MB-2GB)");
     Log("  [ OK ] Process priority (Above Normal)");
     Log("  [ OK ] FPS cap removal (200 -> 999)");
-    Log("  [%s] Lua VM GC optimizer",        luaOk  ? "WAIT" : "SKIP");
+    Log("  [%s] Lua VM GC optimizer",         luaOk       ? "WAIT" : "SKIP");
+    Log("  [%s] Combat log optimizer",        combatLogOk ? " OK " : "SKIP");
 
     return 0;
 }
@@ -736,6 +746,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             CreateThread(NULL, 0, MainThread, NULL, 0, NULL);
             break;
         case DLL_PROCESS_DETACH:
+            CombatLogOpt::Shutdown();
             LuaOpt::Shutdown();
             MH_DisableHook(MH_ALL_HOOKS);
             MH_Uninitialize();
