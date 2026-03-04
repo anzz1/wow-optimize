@@ -58,6 +58,8 @@ add_library(version SHARED
     src/version_exports.def
 )
 
+target_sources(wow_optimize PRIVATE src/version.rc)
+
 set_target_properties(version PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
     OUTPUT_NAME "version"

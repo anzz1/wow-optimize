@@ -1,10 +1,10 @@
-# 🚀 wow_optimize v1.2 BY SUPREMATIST
+# 🚀 wow_optimize v1.3.0 BY SUPREMATIST
 
 **Performance optimization DLL for World of Warcraft 3.3.5a (WotLK)**
 
-Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threading, frame pacing, and Lua VM garbage collection — all through a single injectable DLL.
+Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threading, frame pacing, and Lua VM — all through a single injectable DLL.
 
-> ⚠️ **Disclaimer:** This project is provided as-is for educational purposes. DLL injection may violate the Terms of Service of private servers. **No ban has been reported**, but **use at your own risk.** The authors are not responsible for any consequences including but not limited to account suspensions.
+> ⚠️ **Disclaimer:** This project is provided as-is for educational purposes. DLL injection may violate the Terms of Service of private servers. **No ban has been reported**, but **use at your own risk.** The author is not responsible for any consequences including but not limited to account suspensions.
 
 ---
 
@@ -12,20 +12,48 @@ Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threadi
 
 | # | Feature | What It Does |
 |---|---------|--------------|
-| 1 | **mimalloc Allocator** | Replaces msvcr80 `malloc`/`free` with Microsoft's modern allocator |
-| 2 | **Sleep Hook** | Precise frame pacing via QPC busy-wait (eliminates Sleep jitter) |
-| 3 | **TCP\_NODELAY** | Disables Nagle's algorithm on all sockets (lower ping) |
-| 4 | **GetTickCount Hook** | QPC-based microsecond precision (better internal timers) |
-| 5 | **CriticalSection Spin** | Adds spin count to all locks (fewer context switches) |
-| 6 | **ReadFile Cache** | 64KB read-ahead cache for MPQ files (faster loading) |
-| 7 | **CreateFile Hints** | Sequential scan flags for MPQ (OS prefetch optimization) |
-| 8 | **CloseHandle Hook** | Cache invalidation on file close (prevents stale data) |
-| 9 | **Timer Resolution** | 0.5ms system timer via NtSetTimerResolution |
-| 10 | **Thread Affinity** | Pins main thread to optimal core (stable L1/L2 cache) |
-| 11 | **Working Set** | Locks 256MB–2GB in RAM (prevents page-outs) |
-| 12 | **Process Priority** | Above Normal + disabled priority boost |
-| 13 | **FPS Cap Removal** | Raises hardcoded 200 FPS limit to 999 |
-| 14 | **Lua VM Optimizer** | Per-frame GC stepping from C, combat-aware, auto UI reload detection |
+| 1 | **mimalloc Allocator** | Replaces msvcr80/ucrtbase `malloc`/`free` with Microsoft's modern allocator |
+| 2 | **Lua VM Allocator** | Replaces WoW's internal Lua pool allocator with mimalloc (v1.3.0) |
+| 3 | **Sleep Hook** | Precise frame pacing via QPC busy-wait (eliminates Sleep jitter) |
+| 4 | **TCP\_NODELAY** | Disables Nagle's algorithm on all sockets (lower ping) |
+| 5 | **GetTickCount Hook** | QPC-based microsecond precision (better internal timers) |
+| 6 | **CriticalSection Spin** | Adds spin count to all locks (fewer context switches) |
+| 7 | **ReadFile Cache** | 64KB read-ahead cache for MPQ files (faster loading) |
+| 8 | **CreateFile Hints** | Sequential scan flags for MPQ (OS prefetch optimization) |
+| 9 | **CloseHandle Hook** | Cache invalidation on file close (prevents stale data) |
+| 10 | **Timer Resolution** | 0.5ms system timer via NtSetTimerResolution |
+| 11 | **Thread Affinity** | Pins main thread to optimal core (stable L1/L2 cache) |
+| 12 | **Working Set** | Locks 256MB–2GB in RAM (prevents page-outs) |
+| 13 | **Process Priority** | Above Normal + disabled priority boost |
+| 14 | **FPS Cap Removal** | Raises hardcoded 200 FPS limit to 999 |
+| 15 | **Lua VM GC Optimizer** | 4-tier per-frame GC stepping from C (loading/combat/idle/normal) |
+
+---
+
+## 🆕 What's New in v1.3.0
+
+### Lua Allocator Replacement (major)
+
+WoW's Lua VM uses a **custom pool allocator** with 9 size buckets + SMemAlloc fallback. Neither path goes through CRT malloc — meaning the previous mimalloc hooks **didn't cover Lua allocations at all**.
+
+Now the DLL replaces the `frealloc` pointer inside Lua's `global_State`:
+- All new Lua allocations (strings, tables, closures, userdata) go through **mimalloc**
+- Old pointers from WoW's pool are freed via the original allocator (safe transition)
+- Automatic re-application after `/reload`
+- Stats tracking with periodic logging
+
+**Impact:** Every `table.insert`, `string.format`, closure creation, and addon data structure now benefits from mimalloc's faster allocation and lower fragmentation.
+
+### 4-Tier GC Stepping
+
+GC step size now adapts to game state:
+
+| Mode | Step Size | When |
+|------|-----------|------|
+| **Loading** | 256 KB/frame | During loading screens (no rendering) |
+| **Combat** | 16 KB/frame | In combat (protect frametime) |
+| **Idle** | 128 KB/frame | AFK / no activity |
+| **Normal** | 64 KB/frame | Default gameplay |
 
 ---
 
@@ -41,6 +69,7 @@ This is **not** a magic FPS doubler. Think of it like replacing an HDD with an S
 - ✅ Less lag degradation over long sessions (2+ hours)
 - ✅ Lower network latency (spells feel more responsive)
 - ✅ Faster zone loading
+- ✅ Reduced lag spikes on boss kills and dungeon queue pops
 
 ### You WON'T notice
 
@@ -63,10 +92,10 @@ For maximum optimization, use this DLL together with the **[!LuaBoost](https://g
 
 | Layer | Tool | What It Does |
 |-------|------|--------------|
-| **C / Engine** | wow\_optimize.dll | Faster memory, I/O, network, timers, threads, Lua GC from C |
-| **Lua / Addons** | !LuaBoost addon | Faster math/table, incremental GC, table pool, throttle API |
+| **C / Engine** | wow\_optimize.dll | Faster memory, I/O, network, timers, Lua allocator + GC from C |
+| **Lua / Addons** | !LuaBoost addon | Faster math/table, incremental GC, SpeedyLoad, table pool, throttle API |
 
-When both are installed, the DLL handles Lua GC stepping from C (zero Lua overhead) and communicates with the addon via shared globals. The addon provides the GUI, combat awareness, idle detection, and runtime function optimizations.
+When both are installed, the DLL handles Lua allocator replacement and GC stepping from C (zero Lua overhead) and communicates with the addon via shared globals. The addon provides the GUI, combat awareness, idle detection, SpeedyLoad, and runtime function optimizations.
 
 > ⚠️ **Do NOT use [SmartGC](https://github.com/suprepupre/SmartGC) together with !LuaBoost** — SmartGC has been merged into LuaBoost. Using both will cause conflicts.
 
@@ -83,11 +112,9 @@ When both are installed, the DLL handles Lua GC stepping from C (zero Lua overhe
 
 ### Build Steps
 
-```bash
 git clone https://github.com/suprepupre/wow-optimize.git
 cd wow-optimize
 build.bat
-```
 
 Output: `build\Release\wow_optimize.dll` + `build\Release\version.dll`
 
@@ -95,12 +122,10 @@ Output: `build\Release\wow_optimize.dll` + `build\Release\version.dll`
 
 ### Manual Build
 
-```bash
 mkdir build
 cd build
 cmake -G "Visual Studio 17 2022" -A Win32 ..
 cmake --build . --config Release
-```
 
 ---
 
@@ -129,58 +154,39 @@ Download pre-built binaries from [**Releases**](../../releases/latest).
 Check `wow_optimize.log` — all lines should show `[ OK ]`.
 
 ```
-[22:59:07.520] ========================================
-[22:59:07.520]   wow_optimize.dll v1.2 BY SUPREMATIST
-[22:59:07.520]   PID: 31380
-[22:59:07.520] ========================================
-[22:59:07.520] MinHook initialized
-[22:59:07.528] mimalloc configured (large pages, pre-warmed 64MB)
-[22:59:07.606] >>> ALLOCATOR: mimalloc ACTIVE <<<
-[22:59:07.685] Sleep hook: ACTIVE (precise busy-wait + Lua GC stepping)
-[22:59:07.685] GetTickCount hook: ACTIVE
-[22:59:07.685] CriticalSection hook: ACTIVE
-[22:59:07.763] Network hook: ACTIVE
-[22:59:07.763] CreateFile hooks: ACTIVE
-[22:59:07.763] ReadFile hook: ACTIVE
-[22:59:07.764] Timer resolution: 0.500 ms
-[22:59:07.840] Main thread: ideal core 1, priority HIGHEST
-[22:59:07.840] Process: Above Normal priority
-[22:59:07.840] Working set: min 256 MB, max 2048 MB
-[22:59:07.840] FPS cap: changed from 200 to 999
-[22:59:07.840]
-[22:59:07.840] --- Lua VM Optimizer ---
-[22:59:07.841] [LuaOpt] Resolving addresses for build 12340...
-[22:59:07.841] [LuaOpt]   lua_gc                 0x0084ED50  OK
-[22:59:07.841] [LuaOpt]   lua_State* ptr         0x00D3F78C  OK (data)
-[22:59:07.841] [LuaOpt] Resolved: 14 OK, 0 FAILED
-[22:59:07.841] [LuaOpt] Ready — waiting for main thread
-[22:59:07.842]
-[22:59:07.842] ========================================
-[22:59:07.842]   Initialization complete
-[22:59:07.842] ========================================
-[22:59:07.842]
-[22:59:07.842]   [ OK ] mimalloc allocator
-[22:59:07.842]   [ OK ] Sleep hook (frame pacing)
-[22:59:07.842]   [ OK ] GetTickCount (precision)
-[22:59:07.842]   [ OK ] CriticalSection (spin lock)
-[22:59:07.842]   [ OK ] TCP_NODELAY (network)
-[22:59:07.842]   [ OK ] CreateFile (sequential I/O)
-[22:59:07.842]   [ OK ] ReadFile (MPQ read-ahead)
-[22:59:07.842]   [ OK ] CloseHandle (cache cleanup)
-[22:59:07.842]   [ OK ] Timer resolution (0.5ms)
-[22:59:07.842]   [ OK ] Thread affinity + priority
-[22:59:07.842]   [ OK ] Working set (256MB-2GB)
-[22:59:07.842]   [ OK ] Process priority (Above Normal)
-[22:59:07.842]   [ OK ] FPS cap removal (200 -> 999)
-[22:59:07.842]   [WAIT] Lua VM GC optimizer
-[22:59:07.860]
-[22:59:07.860] [LuaOpt] Lua VM Init (main thread)
-[22:59:07.860] [LuaOpt] lua_State* = 0x1A2B3C4D
-[22:59:07.860] [LuaOpt] lua_gc verified: Lua memory = 24576 KB
-[22:59:07.860] [LuaOpt] GC tuned: pause 200->110, stepmul 200->300
-[22:59:07.860] [LuaOpt] Auto GC stopped
-[22:59:07.860] [LuaOpt] Lua interface created via FrameScript
-[22:59:07.860] [LuaOpt] Init complete — GC:YES, step:64/16 KB/frame
+[02:42:28.155] ========================================
+[02:42:28.155]   wow_optimize.dll v1.3.0 BY SUPREMATIST
+[02:42:28.155]   PID: 13088
+[02:42:28.155] ========================================
+[02:42:28.155] MinHook initialized
+[02:42:28.165] mimalloc configured (large pages, pre-warmed 64MB)
+[02:42:28.183] >>> ALLOCATOR: mimalloc ACTIVE <<<
+[02:42:28.197] Sleep hook: ACTIVE (precise busy-wait + Lua GC stepping)
+[02:42:28.215] GetTickCount hook: ACTIVE
+[02:42:28.238] CriticalSection hook: ACTIVE
+[02:42:28.254] Network hook: ACTIVE
+[02:42:28.288] CreateFile hooks: ACTIVE
+[02:42:28.305] ReadFile hook: ACTIVE
+[02:42:28.322] CloseHandle hook: ACTIVE
+[02:42:28.322] Timer resolution: 0.500 ms
+[02:42:28.338] Main thread: ideal core 1, priority HIGHEST
+[02:42:28.338] Process: Above Normal priority
+[02:42:28.338] Working set: min 256 MB, max 2048 MB
+[02:42:28.338] FPS cap: changed from 200 to 999
+[02:42:28.339]   [WAIT] Lua VM GC optimizer
+[02:42:38.789]
+[02:42:38.789] [LuaOpt] lua_State* = 0x18D68A68
+[02:42:38.789] [LuaOpt-Alloc]  >>> ALLOCATOR REPLACED <<<
+[02:42:38.789] [LuaOpt-Alloc]  Old: 0x008558E0 (WoW pool + SMemAlloc)
+[02:42:38.789] [LuaOpt-Alloc]  New: 0x68842750 (mimalloc)
+[02:42:38.789] [LuaOpt]  Init Complete
+[02:42:38.789] [LuaOpt]    Lua allocator:    mimalloc (REPLACED)
+[02:42:38.789] [LuaOpt]    GC optimized:     YES
+[02:42:38.789] [LuaOpt]    GC tiers (KB/f):
+[02:42:38.789] [LuaOpt]      normal  = 64
+[02:42:38.789] [LuaOpt]      combat  = 16
+[02:42:38.789] [LuaOpt]      idle    = 128
+[02:42:38.789] [LuaOpt]      loading = 256
 ```
 
 ### Uninstall
@@ -189,18 +195,29 @@ Delete `version.dll` (and `wow_optimize.dll`) from WoW folder.
 
 ---
 
-## 🧠 Lua VM Optimizer (v1.2)
+## 🧠 Lua VM Optimizer
 
-New in v1.2: The DLL now directly optimizes WoW's Lua 5.1 garbage collector from C code.
+### Lua Allocator Replacement (v1.3.0)
 
-### How It Works
+WoW's Lua 5.1 uses a custom allocator (0x008558E0) with:
 
-1. **Address Discovery** — Finds Lua C API functions in Wow.exe using IDA Pro addresses (build 12340)
-2. **GC Parameter Tuning** — Sets `pause=110` (collect sooner) and `stepmul=300` (collect faster)
-3. **Manual Stepping** — Stops auto-GC, performs controlled incremental steps every frame from the Sleep hook
-4. **Combat Awareness** — Reads combat state from the LuaBoost addon, reduces GC during fights (16 KB vs 64 KB per frame)
-5. **Addon Communication** — Writes stats to Lua globals, creates pure Lua wrapper functions via `FrameScript_Execute`
-6. **UI Reload Handling** — Detects `lua_State*` changes and reinitializes automatically
+    9 size-class pools for small objects (strings, small tables, closures)
+    SMemAlloc/SMemFree fallback for large objects
+
+Neither path goes through CRT malloc — so mimalloc CRT hooks don't cover Lua at all.
+
+The DLL replaces the frealloc function pointer in Lua's global_State:
+
+    New allocations → mimalloc (faster, less fragmentation)
+    Old pointers → freed via original allocator (safe coexistence during transition)
+    Realloc migration: old data copied to mimalloc, old pointer freed via original
+    Automatic re-application after UI reload (/reload)
+
+### GC Parameter Tuning
+
+    pause=110 (collect sooner, default 200)
+    stepmul=300 (collect faster, default 200)
+    Auto-GC stopped — manual per-frame stepping only
 
 ### DLL ↔ Addon Communication
 
@@ -232,6 +249,16 @@ After injection:   malloc() → mimalloc heap
                    free()   → checks which heap owns the pointer
                               ├── mimalloc → mi_free()
                               └── old CRT  → original free()
+```
+
+### Lua Allocator Transition
+
+```
+Before replacement:  Lua alloc → WoW pool (small) / SMemAlloc (large)
+After replacement:   Lua alloc → mimalloc
+                     Lua free  → checks which heap owns the pointer
+                                 ├── mimalloc     → mi_free()
+                                 └── WoW pool/SMem → original frealloc()
 ```
 
 ### CRT Auto-Detection
@@ -320,10 +347,11 @@ What this DLL **does**:
 wow-optimize/
 ├── src/
 │   ├── dllmain.cpp          # Main DLL — all system hooks
-│   ├── lua_optimize.cpp     # Lua VM GC optimizer module
+│   ├── lua_optimize.cpp     # Lua VM optimizer (allocator + GC + communication)
 │   ├── lua_optimize.h       # Lua optimizer interface
 │   ├── version_proxy.cpp    # Auto-loader (version.dll proxy)
-│   └── version_exports.def  # Export definitions for version.dll
+│   ├── version_exports.def  # Export definitions for version.dll
+│   └── version.rc           # DLL version info resource
 ├── CMakeLists.txt           # Build config + dependency management
 ├── build.bat                # One-click build script
 ├── README.md
