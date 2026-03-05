@@ -1,34 +1,3 @@
-// ================================================================
-//  wow_optimize.dll v1.4.1 BY SUPREMATIST
-//  Performance optimization DLL for World of Warcraft 3.3.5a
-//
-//  Features:
-//    1.  Microsoft mimalloc allocator (replaces ancient CRT)
-//    2.  Precise frame pacing (Sleep hook with QPC busy-wait)
-//    3.  TCP_NODELAY on all sockets (lower network latency)
-//    4.  High-precision GetTickCount (QPC-based)
-//    5.  CriticalSection spin optimization (fewer context switches)
-//    6.  ReadFile read-ahead cache (MPQ-only, faster loading)
-//    7.  CreateFile sequential scan hints (OS prefetch for MPQ)
-//    8.  CloseHandle cache invalidation (prevents stale data)
-//    9.  High timer resolution (0.5ms via NtSetTimerResolution)
-//    10. Thread affinity pinning (stable L1/L2 cache)
-//    11. Working set locking (prevent page-outs)
-//    12. FPS cap removal (200 -> 999)
-//    13. Process priority optimization
-//    14. Lua VM GC optimizer (per-frame stepping, allocator)
-//    15. Combat log buffer optimizer (retention, anti-recycle)
-//
-//  Must be compiled as 32-bit (x86).
-//  WoW 3.3.5a is a 32-bit application.
-//
-//  Usage:
-//    Option A: Drop version.dll + wow_optimize.dll in WoW folder (auto-load)
-//    Option B: Inject wow_optimize.dll manually with any DLL injector
-//
-//  Check wow_optimize.log for status.
-//  License: MIT
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -56,7 +25,7 @@
 static FILE* g_log = nullptr;
 
 static void LogOpen() {
-    CreateDirectoryA("Logs", NULL); 
+    CreateDirectoryA("Logs", NULL);
     g_log = fopen("Logs\\wow_optimize.log", "w");
 }
 
@@ -185,11 +154,6 @@ static DWORD g_mainThreadId = 0;
 typedef void (WINAPI* Sleep_fn)(DWORD);
 static Sleep_fn orig_Sleep = nullptr;
 
-// Hybrid precise sleep based on github.com/anzz1/precisesleep
-// Uses Sleep(1) while > 2ms remains (lets CPU rest), then
-// spins _mm_pause for the final < 2ms (sub-10us precision).
-// Safe with our NtSetTimerResolution(0.5ms) — Sleep(1) will
-// never actually sleep for 2ms, so the 2ms threshold is safe.
 static double g_sleepFreq = 0.0;
 
 static void PreciseSleep(double milliseconds) {
@@ -309,7 +273,7 @@ typedef BOOL (WINAPI* ReadFile_fn)(HANDLE, LPVOID, DWORD, LPDWORD, LPOVERLAPPED)
 static ReadFile_fn orig_ReadFile = nullptr;
 
 struct ReadCache {
-    HANDLE handle; uint8_t* buffer; DWORD bufferSize;
+    HANDLE handle; uint8_t* buffer;
     LARGE_INTEGER fileOffset; DWORD validBytes; bool active;
 };
 
@@ -318,6 +282,7 @@ static const DWORD READ_AHEAD_SIZE    = 64 * 1024;
 static ReadCache   g_readCache[MAX_CACHED_HANDLES] = {};
 static CRITICAL_SECTION g_cacheLock;
 static bool g_cacheInitialized = false;
+static bool g_csInitialized    = false;
 
 static ReadCache* FindCache(HANDLE h) {
     for (int i = 0; i < MAX_CACHED_HANDLES; i++)
@@ -516,7 +481,7 @@ static BOOL WINAPI hooked_CloseHandle(HANDLE hObject) {
     if (!hObject || hObject == INVALID_HANDLE_VALUE ||
         hObject == GetCurrentProcess() || hObject == GetCurrentThread())
         return orig_CloseHandle(hObject);
-    if (g_mpqHandleCount > 0) UntrackMpqHandle(hObject);
+    UntrackMpqHandle(hObject);
     if (g_cacheInitialized) {
         EnterCriticalSection(&g_cacheLock);
         for (int i = 0; i < MAX_CACHED_HANDLES; i++) {
@@ -688,7 +653,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     LogOpen();
     Log("========================================");
-    Log("  wow_optimize.dll v1.4.0 BY SUPREMATIST");
+    Log("  wow_optimize.dll v1.4.2 BY SUPREMATIST");
     Log("  PID: %lu", GetCurrentProcessId());
     Log("========================================");
 
@@ -697,6 +662,7 @@ static DWORD WINAPI MainThread(LPVOID param) {
 
     InitializeCriticalSection(&g_mpqHandleLock);
     InitializeCriticalSection(&g_cacheLock);
+    g_csInitialized = true;
 
     ConfigureMimalloc();
     TryEnableLargePages();
@@ -776,7 +742,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
             for (int i = 0; i < MAX_CACHED_HANDLES; i++) {
                 if (g_readCache[i].buffer) { mi_free(g_readCache[i].buffer); g_readCache[i].buffer = nullptr; }
             }
-            if (g_cacheInitialized) { DeleteCriticalSection(&g_cacheLock); DeleteCriticalSection(&g_mpqHandleLock); }
+            if (g_csInitialized) {
+                DeleteCriticalSection(&g_cacheLock);
+                DeleteCriticalSection(&g_mpqHandleLock);
+            }
             Log("wow_optimize.dll unloaded");
             LogClose();
             break;

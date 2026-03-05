@@ -1,4 +1,4 @@
-# 🚀 wow_optimize v1.4.1 BY SUPREMATIST
+# 🚀 wow_optimize v1.4.2 BY SUPREMATIST
 
 **Performance optimization DLL for World of Warcraft 3.3.5a (WotLK)**
 
@@ -31,28 +31,15 @@ Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threadi
 
 ---
 
-## 🆕 What's New in v1.4.1
+## 🆕 What's New in v1.4.2
 
-### Combat Log Buffer Optimizer
-
-Fixes the "combat log breaks" problem in 25-man raids where addons like Skada, Recount, and Details lose data during heavy combat.
-
-**Root cause:** WoW stores combat log events in a linked list. When the internal free list is empty and a new event arrives, the allocator checks if the oldest entry has expired (based on `combatLogRetentionTime` CVar, default 300 seconds). If it has, the entry is **recycled** — even if Lua hasn't processed it yet. This means the `COMBAT_LOG_EVENT_UNFILTERED` event never fires for that entry, and damage meter addons miss it.
-
-**Three fixes applied:**
-
-| Fix | What | Why |
-|-----|------|-----|
-| **Retention 300→1800 sec** | Entries survive 30 minutes instead of 5 | More time for Lua to process during heavy combat bursts |
-| **Periodic cleanup** | Frees expired entries from C every ~10 sec | Replaces CombatLogFix addon. Respects Lua processing boundary — never frees unprocessed entries |
-| **Disable recycling** | Patch `js` → `jmp` in entry allocator | Allocator always creates new nodes instead of recycling unprocessed ones |
-
-
-**Impact:**
-- ✅ No more "combat log breaks" in ICC/RS 25-man
-- ✅ Skada/Recount/Details show accurate data throughout the fight
-- ✅ Replaces CombatLogFix addon (no Lua overhead)
-- ✅ ~5-10 MB extra RAM usage (negligible)
+### Bug Fixes
+- **Fixed memory protection leak** — VirtualProtect now correctly restores original page protection after Lua allocator replacement. Previously the memory region was left as PAGE_READWRITE permanently.
+- **Fixed UI reload crash path** — On `/reload`, the original Lua allocator is now properly restored before resetting internal state. Previously, if WoW accessed the old global_State during transition, it could dereference a null function pointer.
+- **Fixed version string inconsistencies** — Log output and fallback code path now correctly report the actual version.
+- **Fixed race condition** — Removed unsynchronized read of MPQ handle count in CloseHandle hook.
+- **Fixed CriticalSection cleanup** — Init and delete of critical sections are now properly symmetric, preventing potential kernel object leaks on DLL unload.
+- **Fixed proxy DLL logging** — version.dll proxy now creates the Logs directory before attempting to write its log file.
 
 ---
 
@@ -165,7 +152,7 @@ Check `Logs/wow_optimize.log` — all lines should show `[ OK ]`.
 
 ```
 [02:42:28.155] ========================================
-[02:42:28.155]   wow_optimize.dll v1.4.1 BY SUPREMATIST
+[02:42:28.155]   wow_optimize.dll v1.4.2 BY SUPREMATIST
 [02:42:28.155]   PID: 13088
 [02:42:28.155] ========================================
 [02:42:28.155] MinHook initialized

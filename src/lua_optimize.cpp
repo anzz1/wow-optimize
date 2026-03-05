@@ -1,23 +1,3 @@
-// ================================================================
-//  Lua VM Optimizer — Implementation
-//  WoW 3.3.5a build 12340 (Warmane)
-//
-//  4-tier GC stepping: loading → combat → idle → normal
-//  Lua allocator replacement: WoW pool → mimalloc
-//  Reads addon state from Lua globals, adjusts step size per-frame.
-//
-//  IMPORTANT: WoW validates C function pointers passed via
-//  lua_pushcclosure(). If the pointer is outside Wow.exe's
-//  code section, WoW crashes with "Invalid function pointer".
-//
-//  Therefore we DO NOT register any C functions to Lua.
-//  Instead we:
-//    1. Call lua_gc() directly for GC stepping (C→Lua API, safe)
-//    2. Write stats to Lua globals via lua_push*/lua_setfield
-//    3. Use FrameScript_Execute for complex Lua-side setup
-//    4. The addon reads our globals — no C callbacks needed
-// ================================================================
-
 #include "lua_optimize.h"
 #include <cstdio>
 #include <cstring>
@@ -250,14 +230,6 @@ static lua_State* ReadLuaState() {
 
 // ================================================================
 //  Lua Allocator Replacement — mimalloc for Lua VM
-//
-//  WoW's Lua uses a custom pool allocator at 0x008558E0.
-//  It has 9 size buckets for small objects and falls back to
-//  SMemAlloc/SMemFree for large objects.
-//
-//  global_State layout (confirmed via diagnosis):
-//    G+0x0C: frealloc     (allocator function pointer)
-//    G+0x10: ud           (allocator userdata)
 // ================================================================
 
 typedef void* (__cdecl *lua_Alloc_fn)(void* ud, void* ptr, size_t osize, size_t nsize);
@@ -381,8 +353,11 @@ static bool ReplaceLuaAllocator(lua_State* L) {
         if (verify != (uintptr_t)&MimallocLuaAlloc) {
             Log("[LuaOpt-Alloc] ERROR: Write verification failed!");
             *(uintptr_t*)(g_globalStateAddr + 0x0C) = (uintptr_t)g_origLuaAlloc;
+            VirtualProtect((void*)(g_globalStateAddr + 0x0C), 4, oldProtect, &oldProtect);
             return false;
         }
+
+        VirtualProtect((void*)(g_globalStateAddr + 0x0C), 4, oldProtect, &oldProtect);
 
         g_luaAllocReplaced = true;
 
@@ -409,7 +384,10 @@ static void RestoreLuaAllocator() {
 
     __try {
         if (IsReadableMemory(g_globalStateAddr + 0x0C)) {
+            DWORD oldProtect;
+            VirtualProtect((void*)(g_globalStateAddr + 0x0C), 4, PAGE_READWRITE, &oldProtect);
             *(uintptr_t*)(g_globalStateAddr + 0x0C) = (uintptr_t)g_origLuaAlloc;
+            VirtualProtect((void*)(g_globalStateAddr + 0x0C), 4, oldProtect, &oldProtect);
             Log("[LuaOpt-Alloc] Allocator restored to original (0x%08X)",
                 (unsigned)(uintptr_t)g_origLuaAlloc);
         }
@@ -632,7 +610,7 @@ static void SetupLuaInterface(lua_State* L) {
     if (!Api.FrameScript_Execute) {
         if (Api.lua_pushboolean && Api.lua_setfield) {
             WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_LOADED",    true);
-            WriteLuaGlobal_String(L, "LUABOOST_DLL_VERSION",   "1.3.0");
+            WriteLuaGlobal_String(L, "LUABOOST_DLL_VERSION",   "1.4.2");
             WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_GC_ACTIVE", State.gcOptimized);
             WriteLuaGlobal_Bool(L,   "LUABOOST_DLL_LUA_ALLOC", g_luaAllocReplaced);
             Log("[LuaOpt] Set DLL globals via Lua API (no FrameScript)");
@@ -643,7 +621,7 @@ static void SetupLuaInterface(lua_State* L) {
     __try {
         Api.FrameScript_Execute(
             "LUABOOST_DLL_LOADED = true "
-            "LUABOOST_DLL_VERSION = '1.4.1' "
+            "LUABOOST_DLL_VERSION = '1.4.2' "
 
             "if LUABOOST_ADDON_COMBAT  == nil then LUABOOST_ADDON_COMBAT  = false end "
             "if LUABOOST_ADDON_IDLE    == nil then LUABOOST_ADDON_IDLE    = false end "
@@ -831,14 +809,14 @@ void OnMainThreadSleep(DWORD mainThreadId) {
     lua_State* currentL = ReadLuaState();
     if (!currentL) return;
 
-    // Detect UI reload (lua_State pointer changed)
     if (currentL != Api.L) {
         Log("[LuaOpt] lua_State changed (UI reload) — reinitializing");
 
         if (g_luaAllocReplaced) {
             LogLuaAllocStats();
-            ResetAllocStats();
+            RestoreLuaAllocator();
         }
+        ResetAllocStats();
 
         Api.L = currentL;
         State.gcOptimized = false;
@@ -853,7 +831,6 @@ void OnMainThreadSleep(DWORD mainThreadId) {
         return;
     }
 
-    // Per-frame work
     ReadAddonStateFromLua(Api.L);
     ProcessGCRequests(Api.L);
     StepGC(Api.L);
@@ -862,7 +839,6 @@ void OnMainThreadSleep(DWORD mainThreadId) {
         UpdateLuaStats(Api.L);
     }
 
-    // Log allocator stats every ~60 seconds
     if (g_luaAllocReplaced && (State.statsUpdateCounter & 4095) == 0) {
         LogLuaAllocStats();
     }
@@ -871,7 +847,6 @@ void OnMainThreadSleep(DWORD mainThreadId) {
 void Shutdown() {
     if (!State.initialized) return;
 
-    // Log and restore allocator
     if (g_luaAllocReplaced) {
         LogLuaAllocStats();
         RestoreLuaAllocator();

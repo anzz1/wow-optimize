@@ -1,14 +1,3 @@
-// ================================================================
-//  version.dll proxy — auto-loader for wow_optimize.dll
-//
-//  Windows loads DLLs from the application directory before
-//  System32. By placing our version.dll in the WoW folder,
-//  WoW loads ours first. We forward all real calls to the
-//  system version.dll and additionally load wow_optimize.dll.
-//
-//  No files are modified. No injector needed. Just drop and play.
-// ================================================================
-
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -54,9 +43,6 @@ static VerInstallFileW_fn           real_VerInstallFileW           = nullptr;
 static VerLanguageNameA_fn          real_VerLanguageNameA          = nullptr;
 static VerLanguageNameW_fn          real_VerLanguageNameW          = nullptr;
 
-// ================================================================
-// Load the real version.dll from System32
-// ================================================================
 static bool LoadRealVersionDll() {
     char systemPath[MAX_PATH];
     GetSystemDirectoryA(systemPath, MAX_PATH);
@@ -166,6 +152,7 @@ static DWORD WINAPI LoaderThread(LPVOID param) {
 
     DWORD attrib = GetFileAttributesA(dllPath);
     if (attrib == INVALID_FILE_ATTRIBUTES) {
+        CreateDirectoryA("Logs", NULL);
         FILE* f = fopen("Logs\\wow_optimize_proxy.log", "w");
         if (f) {
             fprintf(f, "ERROR: wow_optimize.dll not found at: %s\n", dllPath);
@@ -177,6 +164,7 @@ static DWORD WINAPI LoaderThread(LPVOID param) {
 
     HMODULE hOptDll = LoadLibraryA(dllPath);
 
+    CreateDirectoryA("Logs", NULL);
     FILE* f = fopen("Logs\\wow_optimize_proxy.log", "w");
     if (f) {
         if (hOptDll)
