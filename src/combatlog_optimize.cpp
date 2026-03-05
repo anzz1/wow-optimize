@@ -48,42 +48,26 @@ extern "C" void Log(const char* fmt, ...);
 // ================================================================
 
 namespace Addr {
-    // CVar* for "combatLogRetentionTime" (default "300" sec)
     static constexpr uintptr_t CVar_RetentionPtr  = 0x00BD09F0;
-
-    // Linked list pointers
     static constexpr uintptr_t ActiveListHead     = 0x00ADB97C;
     static constexpr uintptr_t FreeListHead       = 0x00ADB988;
-
-    // Lua processing state
     static constexpr uintptr_t PendingEntry       = 0x00CA1394;
-
-    // Game clock (milliseconds)
     static constexpr uintptr_t CurrentTime        = 0x00CD76AC;
-
-    // sub_750390: frees one entry (__thiscall, ecx = entry)
-    // Removes from active list, adds to free list.
-    // Advances CA1394 if freeing the pending entry.
     static constexpr uintptr_t FreeEntryFunc      = 0x00750390;
-
-    // Location of 'js' instruction in sub_750400 (entry allocator)
-    // This jump decides: recycle oldest entry vs allocate new.
-    // js (0x78) = skip recycle if entry not expired
-    // Patch to jmp (0xEB) = always skip recycle
     static constexpr uintptr_t RecycleJumpAddr    = 0x0075043D;
 }
 
-// CVar structure offset for cached integer value
 static constexpr int CVAR_INT_OFFSET = 0x30;
 
 // ================================================================
 //  Configuration
 // ================================================================
 
-static constexpr int TARGET_RETENTION_SEC      = 900;   // 15 min (default 300 = 5 min)
-static constexpr int CLEANUP_INTERVAL_FRAMES   = 1800;  // ~30 sec at 60 fps
-static constexpr int RETENTION_CHECK_FRAMES    = 600;   // re-verify retention ~10 sec
-static constexpr int MAX_FREE_PER_CLEANUP      = 50000; // safety limit
+static constexpr int TARGET_RETENTION_SEC      = 900;
+static constexpr int CLEANUP_INTERVAL_FRAMES   = 1800;
+static constexpr int RETENTION_CHECK_FRAMES    = 600;
+static constexpr int MAX_FREE_PER_CLEANUP      = 50000;
+static constexpr int MAX_RETENTION_RETRIES      = 600;   // ~10 sec at 60fps
 
 // ================================================================
 //  State
@@ -92,6 +76,8 @@ static constexpr int MAX_FREE_PER_CLEANUP      = 50000; // safety limit
 static bool    g_initialized       = false;
 static int     g_origRetention     = 0;
 static bool    g_retentionPatched  = false;
+static bool    g_retentionGaveUp   = false;
+static int     g_retentionRetries  = 0;
 static bool    g_recyclePatched    = false;
 static uint8_t g_origRecycleByte   = 0;
 
@@ -100,8 +86,6 @@ static int g_retentionCheckCounter = 0;
 static int g_totalEntriesCleaned   = 0;
 static int g_cleanupCycles         = 0;
 
-// sub_750390 is __thiscall (ecx = entry, no stack args).
-// Call via __fastcall: first arg → ecx, second arg → edx (ignored).
 typedef void (__fastcall *FreeEntry_fn)(void* entry, void* edx_unused);
 static FreeEntry_fn g_freeEntry = nullptr;
 
@@ -155,50 +139,38 @@ static bool WriteRetention(int seconds) {
 }
 
 // ================================================================
-//  Patch 1: Retention Time
+//  Patch 1: Retention Time (with retry support)
 // ================================================================
 
-static bool PatchRetention() {
+// Returns: 1 = success, 0 = not ready (retry later), -1 = permanent failure
+static int TryPatchRetention() {
     if (!IsReadable(Addr::CVar_RetentionPtr)) {
-        Log("[CombatLog] CVar address not readable");
-        return false;
+        return 0;
     }
 
     int current = ReadRetention();
     if (current < 0) {
-        Log("[CombatLog] Failed to read retention value");
-        return false;
+        return 0;  // CVar not initialized yet
+    }
+
+    if (current <= 0 || current > 100000) {
+        Log("[CombatLog] Implausible retention value: %d", current);
+        return -1;
     }
 
     g_origRetention = current;
-    Log("[CombatLog] Current retention: %d sec", current);
-
-    if (current <= 0 || current > 100000) {
-        Log("[CombatLog] Implausible value — wrong offset?");
-        return false;
-    }
 
     if (!WriteRetention(TARGET_RETENTION_SEC)) {
         Log("[CombatLog] Failed to write retention value");
-        return false;
+        return -1;
     }
 
     g_retentionPatched = true;
-    Log("[CombatLog] Retention: %d -> %d sec", current, TARGET_RETENTION_SEC);
-    return true;
+    return 1;
 }
 
 // ================================================================
 //  Patch 2: Disable Retention Recycling
-//
-//  In sub_750400 the allocator checks:
-//    age = currentTime - (retention * 1000) - entry.timestamp
-//    js short loc_750446   ; if age < 0, entry not expired → alloc new
-//    call sub_750390        ; expired → recycle (may destroy pending!)
-//
-//  Patching js (0x78) to jmp (0xEB) makes the allocator always
-//  take the "alloc new" path. Expired entries are cleaned up
-//  separately by our periodic cleanup which respects CA1394.
 // ================================================================
 
 static bool PatchRecycle() {
@@ -219,7 +191,7 @@ static bool PatchRecycle() {
 
         DWORD oldProtect;
         VirtualProtect((void*)Addr::RecycleJumpAddr, 1, PAGE_EXECUTE_READWRITE, &oldProtect);
-        *(uint8_t*)Addr::RecycleJumpAddr = 0xEB; // jmp short
+        *(uint8_t*)Addr::RecycleJumpAddr = 0xEB;
         VirtualProtect((void*)Addr::RecycleJumpAddr, 1, oldProtect, &oldProtect);
 
         g_recyclePatched = true;
@@ -235,13 +207,6 @@ static bool PatchRecycle() {
 
 // ================================================================
 //  Periodic Cleanup
-//
-//  Walks the active list from HEAD (oldest) and frees entries
-//  that have expired. Stops at the pending entry (CA1394) to
-//  guarantee no unprocessed events are lost.
-//
-//  Freed entries go to the free list and get reused by
-//  sub_750400, keeping memory stable.
 // ================================================================
 
 static void CleanupExpiredEntries() {
@@ -263,15 +228,13 @@ static void CleanupExpiredEntries() {
             uintptr_t head = *(uintptr_t*)Addr::ActiveListHead;
 
             if (!head || (head & 1)) break;
-            if (head == prevHead) break;     // list didn't advance
+            if (head == prevHead) break;
             if (!IsReadable(head + 8)) break;
-
-            // Never free entries that Lua hasn't processed yet
             if (head == pending) break;
 
             int timestamp = *(int*)(head + 8);
             int age = currentTime - timestamp;
-            if (age < retentionMs) break;    // not expired yet
+            if (age < retentionMs) break;
 
             prevHead = head;
             g_freeEntry((void*)head, nullptr);
@@ -309,11 +272,18 @@ bool Init() {
     }
     g_freeEntry = (FreeEntry_fn)Addr::FreeEntryFunc;
 
-    bool retOk = PatchRetention();
-    bool recOk = PatchRecycle();
+    int retResult = TryPatchRetention();
+    if (retResult == 1) {
+        Log("[CombatLog]  [ OK ] Retention time (%d -> %d sec)",
+            g_origRetention, TARGET_RETENTION_SEC);
+    } else if (retResult == 0) {
+        Log("[CombatLog]  [WAIT] Retention time — CVar not ready, will retry");
+    } else {
+        Log("[CombatLog]  [FAIL] Retention time");
+        g_retentionGaveUp = true;
+    }
 
-    Log("[CombatLog]  [%s] Retention time (%d -> %d sec)",
-        retOk ? " OK " : "FAIL", g_origRetention, TARGET_RETENTION_SEC);
+    bool recOk = PatchRecycle();
     Log("[CombatLog]  [%s] Prevent entry recycling",
         recOk ? " OK " : "SKIP");
     Log("[CombatLog]  [ OK ] Periodic cleanup (every %d frames)",
@@ -321,14 +291,30 @@ bool Init() {
     Log("[CombatLog] ====================================");
 
     g_initialized = true;
-    return retOk || recOk;
+    return recOk || g_retentionPatched;
 }
 
 void OnFrame(DWORD mainThreadId) {
     if (!g_initialized) return;
     if (GetCurrentThreadId() != mainThreadId) return;
 
-    // Re-apply retention if something overwrites it (addon or /console)
+    // Retry retention patch if it wasn't ready during Init
+    if (!g_retentionPatched && !g_retentionGaveUp) {
+        g_retentionRetries++;
+        if ((g_retentionRetries & 15) == 0) {
+            int result = TryPatchRetention();
+            if (result == 1) {
+                Log("[CombatLog] Retention patched on retry #%d: %d -> %d sec",
+                    g_retentionRetries, g_origRetention, TARGET_RETENTION_SEC);
+            } else if (result == -1 || g_retentionRetries >= MAX_RETENTION_RETRIES) {
+                g_retentionGaveUp = true;
+                Log("[CombatLog] Retention patch failed after %d retries",
+                    g_retentionRetries);
+            }
+        }
+    }
+
+    // Re-apply retention if something overwrites it
     g_retentionCheckCounter++;
     if (g_retentionPatched && g_retentionCheckCounter >= RETENTION_CHECK_FRAMES) {
         g_retentionCheckCounter = 0;
