@@ -160,7 +160,7 @@ Download pre-built binaries from [**Releases**](../../releases/latest).
 
 ### Verify
 
-Check `wow_optimize.log` — all lines should show `[ OK ]`.
+Check `Logs/wow_optimize.log` — all lines should show `[ OK ]`.
 
 ```
 [02:42:28.155] ========================================
@@ -202,7 +202,7 @@ Check `wow_optimize.log` — all lines should show `[ OK ]`.
 
 ### Uninstall
 
-Delete `version.dll` (and `wow_optimize.dll`) from WoW folder.
+Delete `version.dll` (and `wow_optimize.dll`) from WoW folder. Log files in `Logs/` folder can be safely deleted.
 
 ---
 
@@ -399,7 +399,7 @@ What this DLL **does**:
 
 | Problem | Solution |
 |---------|----------|
-| Proxy DLL doesn't load (no log file) | See above — UNCHECK "disable fullscreen optimizations" on `Wow.exe` |
+| Proxy DLL doesn't load (no log file) | Check `Logs/wow_optimize_proxy.log`. If the file doesn't exist, see above — UNCHECK "disable fullscreen optimizations" on `Wow.exe` |
 | WoW crashes after injection | Wait for login screen + 10 seconds before injecting |
 | `FATAL: MinHook initialization failed` | Another hook DLL conflicting |
 | `ERROR: No CRT DLL found` | Non-standard WoW build |
