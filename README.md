@@ -1,4 +1,4 @@
-# 🚀 wow_optimize v1.4.0 BY SUPREMATIST
+# 🚀 wow_optimize v1.4.1 BY SUPREMATIST
 
 **Performance optimization DLL for World of Warcraft 3.3.5a (WotLK)**
 
@@ -31,7 +31,7 @@ Replaces WoW's ancient memory allocator, optimizes I/O, network, timers, threadi
 
 ---
 
-## 🆕 What's New in v1.4.0
+## 🆕 What's New in v1.4.1
 
 ### Combat Log Buffer Optimizer
 
@@ -43,9 +43,10 @@ Fixes the "combat log breaks" problem in 25-man raids where addons like Skada, R
 
 | Fix | What | Why |
 |-----|------|-----|
-| **Retention 300→900 sec** | Entries survive 15 minutes instead of 5 | More time for Lua to process during heavy combat bursts |
+| **Retention 300→1800 sec** | Entries survive 30 minutes instead of 5 | More time for Lua to process during heavy combat bursts |
+| **Periodic cleanup** | Frees expired entries from C every ~10 sec | Replaces CombatLogFix addon. Respects Lua processing boundary — never frees unprocessed entries |
 | **Disable recycling** | Patch `js` → `jmp` in entry allocator | Allocator always creates new nodes instead of recycling unprocessed ones |
-| **Periodic cleanup** | Frees expired entries from C every ~30 sec | Replaces CombatLogFix addon. Respects Lua processing boundary — never frees unprocessed entries |
+
 
 **Impact:**
 - ✅ No more "combat log breaks" in ICC/RS 25-man
@@ -164,7 +165,7 @@ Check `Logs/wow_optimize.log` — all lines should show `[ OK ]`.
 
 ```
 [02:42:28.155] ========================================
-[02:42:28.155]   wow_optimize.dll v1.4.0 BY SUPREMATIST
+[02:42:28.155]   wow_optimize.dll v1.4.1 BY SUPREMATIST
 [02:42:28.155]   PID: 13088
 [02:42:28.155] ========================================
 [02:42:28.155] MinHook initialized
@@ -190,7 +191,7 @@ Check `Logs/wow_optimize.log` — all lines should show `[ OK ]`.
 [02:42:28.340] [CombatLog] ====================================
 [02:42:28.340] [CombatLog] Current retention: 300 sec
 [02:42:28.340] [CombatLog] Retention: 300 -> 900 sec
-[02:42:28.340] [CombatLog] Retention recycling disabled (0x0075043D: js -> jmp)
+[02:42:28.340] [CombatLog]  [ OK ] Periodic cleanup (every 600 frames)
 [02:42:28.340] [CombatLog]  [ OK ] Retention time (300 -> 900 sec)
 [02:42:28.340] [CombatLog]  [ OK ] Prevent entry recycling
 [02:42:28.340] [CombatLog]  [ OK ] Periodic cleanup (every 1800 frames)

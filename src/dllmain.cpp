@@ -1,5 +1,5 @@
 // ================================================================
-//  wow_optimize.dll v1.4.0 BY SUPREMATIST
+//  wow_optimize.dll v1.4.1 BY SUPREMATIST
 //  Performance optimization DLL for World of Warcraft 3.3.5a
 //
 //  Features:
