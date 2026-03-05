@@ -56,7 +56,8 @@
 static FILE* g_log = nullptr;
 
 static void LogOpen() {
-    g_log = fopen("wow_optimize.log", "w");
+    CreateDirectoryA("Logs", NULL); 
+    g_log = fopen("Logs\\wow_optimize.log", "w");
 }
 
 static void LogClose() {

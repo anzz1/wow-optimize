@@ -166,7 +166,7 @@ static DWORD WINAPI LoaderThread(LPVOID param) {
 
     DWORD attrib = GetFileAttributesA(dllPath);
     if (attrib == INVALID_FILE_ATTRIBUTES) {
-        FILE* f = fopen("wow_optimize_proxy.log", "w");
+        FILE* f = fopen("Logs\\wow_optimize_proxy.log", "w");
         if (f) {
             fprintf(f, "ERROR: wow_optimize.dll not found at: %s\n", dllPath);
             fprintf(f, "Place wow_optimize.dll in the same folder as Wow.exe\n");
@@ -177,7 +177,7 @@ static DWORD WINAPI LoaderThread(LPVOID param) {
 
     HMODULE hOptDll = LoadLibraryA(dllPath);
 
-    FILE* f = fopen("wow_optimize_proxy.log", "w");
+    FILE* f = fopen("Logs\\wow_optimize_proxy.log", "w");
     if (f) {
         if (hOptDll)
             fprintf(f, "OK: wow_optimize.dll loaded from: %s\n", dllPath);
