@@ -2,23 +2,19 @@
 //  Combat Log Buffer Optimizer — Implementation
 //  WoW 3.3.5a build 12340 (Warmane)
 //
-//  Prevents combat log data loss in raids by increasing the
-//  retention time for combat log entries. Combined with periodic
-//  cleanup of expired entries, this ensures addons have enough
-//  time to process all events without the allocator recycling
-//  unprocessed entries.
+//  Two-layer fix for combat log breaks:
 //
-//  Architecture:
-//    ADB97C = HEAD of active entry list (oldest first)
-//    ADB988 = HEAD of free list (recycled entries)
-//    CA1394 = pointer to first unprocessed entry (Lua push queue)
-//    BD09F0 = CVar* "combatLogRetentionTime" (default "300")
-//    CD76AC = game clock in milliseconds
+//  Layer 1: Retention increase (300 -> 1800 sec)
+//    Prevents the allocator from recycling entries that Lua
+//    hasn't processed yet. Addresses the root cause of data
+//    loss during heavy combat bursts.
 //
-//  v1.4.1: Removed the js→jmp recycle patch. It caused crashes
-//  on teleport (entries accumulated indefinitely) and broke
-//  WeakAuras in battlegrounds (event queue grew unbounded).
-//  Retention increase + periodic cleanup is sufficient and safe.
+//  Layer 2: Periodic CombatLogClearEntries
+//    Clears all processed entries every ~10 seconds.
+//    Addresses secondary causes: internal list corruption,
+//    stuck CA1394 pointer, dispatch loop errors.
+//    Only runs when CA1394 == NULL (all entries processed).
+//    Equivalent to CombatLogFix addon but from C level.
 // ================================================================
 
 #include "combatlog_optimize.h"
@@ -33,11 +29,11 @@ extern "C" void Log(const char* fmt, ...);
 // ================================================================
 
 namespace Addr {
-    static constexpr uintptr_t CVar_RetentionPtr  = 0x00BD09F0;
-    static constexpr uintptr_t ActiveListHead     = 0x00ADB97C;
-    static constexpr uintptr_t PendingEntry       = 0x00CA1394;
-    static constexpr uintptr_t CurrentTime        = 0x00CD76AC;
-    static constexpr uintptr_t FreeEntryFunc      = 0x00750390;
+    static constexpr uintptr_t CVar_RetentionPtr     = 0x00BD09F0;
+    static constexpr uintptr_t ActiveListHead        = 0x00ADB97C;
+    static constexpr uintptr_t PendingEntry          = 0x00CA1394;
+    static constexpr uintptr_t CurrentTime           = 0x00CD76AC;
+    static constexpr uintptr_t CombatLogClearEntries = 0x00751120;
 }
 
 static constexpr int CVAR_INT_OFFSET = 0x30;
@@ -46,11 +42,10 @@ static constexpr int CVAR_INT_OFFSET = 0x30;
 //  Configuration
 // ================================================================
 
-static constexpr int TARGET_RETENTION_SEC     = 1800;  // 30 min (default 300 = 5 min)
-static constexpr int CLEANUP_INTERVAL_FRAMES  = 600;   // ~10 sec at 60fps
-static constexpr int RETENTION_CHECK_FRAMES   = 600;
-static constexpr int MAX_FREE_PER_CLEANUP     = 50000;
-static constexpr int MAX_RETENTION_RETRIES    = 600;
+static constexpr int TARGET_RETENTION_SEC    = 1800;  // 30 min (default 300)
+static constexpr int CLEAR_INTERVAL_FRAMES   = 600;   // ~10 sec at 60fps
+static constexpr int RETENTION_CHECK_FRAMES  = 600;
+static constexpr int MAX_RETENTION_RETRIES   = 600;
 
 // ================================================================
 //  State
@@ -62,13 +57,14 @@ static bool    g_retentionPatched  = false;
 static bool    g_retentionGaveUp   = false;
 static int     g_retentionRetries  = 0;
 
-static int g_cleanupCounter        = 0;
+static int g_clearCounter          = 0;
 static int g_retentionCheckCounter = 0;
-static int g_totalEntriesCleaned   = 0;
-static int g_cleanupCycles         = 0;
+static int g_totalClears           = 0;
 
-typedef void (__fastcall *FreeEntry_fn)(void* entry, void* edx_unused);
-static FreeEntry_fn g_freeEntry = nullptr;
+// CombatLogClearEntries is a simple function with no args,
+// uses ecx from global (reads ADB97C internally).
+typedef int (__cdecl *ClearEntries_fn)();
+static ClearEntries_fn g_clearEntries = nullptr;
 
 // ================================================================
 //  Memory Validation
@@ -150,57 +146,38 @@ static int TryPatchRetention() {
 }
 
 // ================================================================
-//  Periodic Cleanup
+//  Periodic Clear
 //
-//  Walks from HEAD (oldest) and frees entries that:
-//    1. Have expired (age > retention time)
-//    2. Have already been processed by Lua (entry != CA1394)
+//  Calls CombatLogClearEntries when all entries have been
+//  processed by Lua (CA1394 == NULL). This prevents the combat
+//  log from entering a broken state due to internal corruption,
+//  stuck pointers, or dispatch errors.
 //
-//  This is the safe version of what CombatLogFix addon does,
-//  but from C level without Lua overhead.
+//  Equivalent to the CombatLogFix addon but from C level:
+//    local f = CreateFrame("Frame")
+//    f:SetScript("OnUpdate", CombatLogClearEntries)
+//
+//  We run it every ~10 seconds instead of every frame — less
+//  aggressive but still effective. Events are dispatched to Lua
+//  via COMBAT_LOG_EVENT_UNFILTERED before we clear, so addons
+//  receive all data.
 // ================================================================
 
-static void CleanupExpiredEntries() {
+static void TryClearProcessedEntries() {
     __try {
-        uintptr_t cvarPtr = *(uintptr_t*)Addr::CVar_RetentionPtr;
-        if (!cvarPtr) return;
-
-        int retentionSec = *(int*)(cvarPtr + CVAR_INT_OFFSET);
-        if (retentionSec <= 0) return;
-        int retentionMs = retentionSec * 1000;
-
-        int currentTime = *(int*)Addr::CurrentTime;
+        // Only clear when Lua has processed everything
         uintptr_t pending = *(uintptr_t*)Addr::PendingEntry;
+        if (pending != 0) return;
 
-        int freed = 0;
-        uintptr_t prevHead = 0;
+        // Only clear if there are entries to clear
+        uintptr_t head = *(uintptr_t*)Addr::ActiveListHead;
+        if (!head || (head & 1)) return;
 
-        for (int i = 0; i < MAX_FREE_PER_CLEANUP; i++) {
-            uintptr_t head = *(uintptr_t*)Addr::ActiveListHead;
-
-            if (!head || (head & 1)) break;
-            if (head == prevHead) break;
-            if (!IsReadable(head + 8)) break;
-
-            // Never free entries that Lua hasn't processed yet
-            if (head == pending) break;
-
-            int timestamp = *(int*)(head + 8);
-            int age = currentTime - timestamp;
-            if (age < retentionMs) break;
-
-            prevHead = head;
-            g_freeEntry((void*)head, nullptr);
-            freed++;
-        }
-
-        if (freed > 0) {
-            g_totalEntriesCleaned += freed;
-            g_cleanupCycles++;
-        }
+        g_clearEntries();
+        g_totalClears++;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("[CombatLog] Exception in cleanup");
+        Log("[CombatLog] Exception in clear");
     }
 }
 
@@ -216,12 +193,11 @@ bool Init() {
     Log("[CombatLog]  Build 12340");
     Log("[CombatLog] ====================================");
 
-    if (!IsExecutable(Addr::FreeEntryFunc)) {
-        Log("[CombatLog] FreeEntry (0x%08X) not found — aborting",
-            (unsigned)Addr::FreeEntryFunc);
+    if (!IsExecutable(Addr::CombatLogClearEntries)) {
+        Log("[CombatLog] CombatLogClearEntries not found — aborting");
         return false;
     }
-    g_freeEntry = (FreeEntry_fn)Addr::FreeEntryFunc;
+    g_clearEntries = (ClearEntries_fn)Addr::CombatLogClearEntries;
 
     int retResult = TryPatchRetention();
     if (retResult == 1) {
@@ -234,12 +210,12 @@ bool Init() {
         g_retentionGaveUp = true;
     }
 
-    Log("[CombatLog]  [ OK ] Periodic cleanup (every %d frames)",
-        CLEANUP_INTERVAL_FRAMES);
+    Log("[CombatLog]  [ OK ] Periodic clear (every %d frames, safe)",
+        CLEAR_INTERVAL_FRAMES);
     Log("[CombatLog] ====================================");
 
     g_initialized = true;
-    return g_retentionPatched;
+    return true;
 }
 
 void OnFrame(DWORD mainThreadId) {
@@ -262,7 +238,7 @@ void OnFrame(DWORD mainThreadId) {
         }
     }
 
-    // Re-apply retention if overwritten by addon or /console
+    // Re-apply retention if overwritten
     g_retentionCheckCounter++;
     if (g_retentionPatched && g_retentionCheckCounter >= RETENTION_CHECK_FRAMES) {
         g_retentionCheckCounter = 0;
@@ -272,13 +248,11 @@ void OnFrame(DWORD mainThreadId) {
         }
     }
 
-    // Periodic cleanup of expired & processed entries
-    g_cleanupCounter++;
-    if (g_cleanupCounter >= CLEANUP_INTERVAL_FRAMES) {
-        g_cleanupCounter = 0;
-        if (g_freeEntry) {
-            CleanupExpiredEntries();
-        }
+    // Periodic clear of processed entries
+    g_clearCounter++;
+    if (g_clearCounter >= CLEAR_INTERVAL_FRAMES) {
+        g_clearCounter = 0;
+        TryClearProcessedEntries();
     }
 }
 
@@ -291,8 +265,7 @@ void Shutdown() {
         g_retentionPatched = false;
     }
 
-    Log("[CombatLog] Shutdown. Cleaned %d entries in %d cycles",
-        g_totalEntriesCleaned, g_cleanupCycles);
+    Log("[CombatLog] Shutdown. Total clears: %d", g_totalClears);
 
     g_initialized = false;
 }
