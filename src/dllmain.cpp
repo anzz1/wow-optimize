@@ -184,15 +184,37 @@ static DWORD g_mainThreadId = 0;
 typedef void (WINAPI* Sleep_fn)(DWORD);
 static Sleep_fn orig_Sleep = nullptr;
 
+// Hybrid precise sleep based on github.com/anzz1/precisesleep
+// Uses Sleep(1) while > 2ms remains (lets CPU rest), then
+// spins _mm_pause for the final < 2ms (sub-10us precision).
+// Safe with our NtSetTimerResolution(0.5ms) — Sleep(1) will
+// never actually sleep for 2ms, so the 2ms threshold is safe.
+static double g_sleepFreq = 0.0;
+
 static void PreciseSleep(double milliseconds) {
-    LARGE_INTEGER freq, start, now;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&start);
-    double target = (milliseconds / 1000.0) * freq.QuadPart;
+    if (!g_sleepFreq) {
+        LARGE_INTEGER li;
+        QueryPerformanceFrequency(&li);
+        g_sleepFreq = (double)li.QuadPart / 1000.0;
+    }
+
+    LARGE_INTEGER li;
+    QueryPerformanceCounter(&li);
+    double start = (double)li.QuadPart / g_sleepFreq;
+    double current = start;
+
     while (true) {
-        QueryPerformanceCounter(&now);
-        if ((double)(now.QuadPart - start.QuadPart) >= target) break;
-        _mm_pause(); _mm_pause(); _mm_pause(); _mm_pause();
+        double elapsed = current - start;
+        if (milliseconds <= elapsed)
+            return;
+
+        if (milliseconds - elapsed > 2.0)
+            orig_Sleep(1);
+        else
+            _mm_pause();
+
+        QueryPerformanceCounter(&li);
+        current = (double)li.QuadPart / g_sleepFreq;
     }
 }
 
@@ -213,7 +235,7 @@ static bool InstallSleepHook() {
     if (!p) return false;
     if (MH_CreateHook(p, (void*)hooked_Sleep, (void**)&orig_Sleep) != MH_OK) return false;
     if (MH_EnableHook(p) != MH_OK) return false;
-    Log("Sleep hook: ACTIVE (frame pacing + Lua GC + combat log)");
+    Log("Sleep hook: ACTIVE (hybrid precise sleep + Lua GC + combat log)");
     return true;
 }
 
